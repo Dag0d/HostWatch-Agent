@@ -1,0 +1,84 @@
+name: Build signed agent release
+
+on:
+  release:
+    types:
+      - published
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  MINIMUM_AGENT_VERSION: "2026.4.1"
+
+jobs:
+  build-agent-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Normalize version
+        id: version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate repository versions
+        shell: bash
+        run: |
+          expected="${{ steps.version.outputs.value }}"
+          agent_version=$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path("agent/hostwatch_agent.py").read_text(encoding="utf8")
+          match = re.search(r'AGENT_VERSION = "([^"]+)"', text)
+          print(match.group(1) if match else "")
+          PY
+          )
+          test "$agent_version" = "$expected"
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          ${{ github.event.release.body }}
+          EOF
+
+      - name: Build agent release assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          python3 scripts/build_agent_release.py \
+            --version "${{ steps.version.outputs.value }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --output-dir dist \
+            --release-notes-file release-notes.md \
+            --minimum-agent-version "${MINIMUM_AGENT_VERSION}"
+
+      - name: Sign agent manifest
+        shell: bash
+        env:
+          HOSTWATCH_RELEASE_SIGNING_KEY_PEM: ${{ secrets.HOSTWATCH_RELEASE_SIGNING_KEY_PEM }}
+        run: |
+          test -n "$HOSTWATCH_RELEASE_SIGNING_KEY_PEM"
+          key_path="$RUNNER_TEMP/hostwatch-release-signing-private.pem"
+          printf '%s\n' "$HOSTWATCH_RELEASE_SIGNING_KEY_PEM" > "$key_path"
+          chmod 600 "$key_path"
+          openssl dgst -sha256 \
+            -sign "$key_path" \
+            -out "dist/hostwatch-agent-manifest-${{ steps.version.outputs.value }}.sig" \
+            "dist/hostwatch-agent-manifest-${{ steps.version.outputs.value }}.json"
+
+      - name: Upload signed agent assets to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            dist/hostwatch-agent-${{ steps.version.outputs.value }}.tar.gz
+            dist/hostwatch-agent-manifest-${{ steps.version.outputs.value }}.json
+            dist/hostwatch-agent-manifest-${{ steps.version.outputs.value }}.sig

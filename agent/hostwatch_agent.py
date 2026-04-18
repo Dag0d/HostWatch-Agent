@@ -23,13 +23,14 @@ import time
 import tarfile
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "2026.4.3"
+AGENT_VERSION = "2026.4.4"
 DEFAULT_CONFIG_PATH = Path(os.environ.get("HOSTWATCH_CONFIG_PATH", "/etc/hostwatch/agent.json"))
 DEFAULT_STATE_PATH = Path(os.environ.get("HOSTWATCH_STATE_PATH", str(DEFAULT_CONFIG_PATH.with_suffix(".state.json"))))
 DEFAULT_SERVICE_NAME = os.environ.get("HOSTWATCH_SERVICE_NAME", "hostwatch-agent.service")
@@ -274,15 +275,16 @@ class SystemMetricsCollector:
     def _collect_updates(self, apt_supported: bool) -> dict[str, Any]:
         if not apt_supported:
             return {"apt": {"supported": False, "upgradable_count": None, "checked_at": None}}
-        now = time.time()
         cached = self._state.get("apt", {})
         cached_checked_at = cached.get("checked_at")
         checked_epoch = parse_iso_timestamp(cached_checked_at) if isinstance(cached_checked_at, str) else 0.0
-        if cached and checked_epoch and (now - checked_epoch) < BOOTLOADER_CHECK_INTERVAL_SECONDS:
+        if cached and checked_epoch:
             self._apt_cache_checked_at = checked_epoch
             self._apt_cache_count = cached.get("upgradable_count")
+        if cached and not is_apt_check_due(cached_checked_at):
             return {"apt": cached}
-        if now - self._apt_cache_checked_at < BOOTLOADER_CHECK_INTERVAL_SECONDS:
+        now = time.time()
+        if self._apt_cache_checked_at and not is_apt_check_due(iso_timestamp(self._apt_cache_checked_at)):
             return {
                 "apt": {
                     "supported": True,
@@ -2072,16 +2074,11 @@ def collect_raspberry_bootloader_status(
     config: AgentConfig, state: AgentStateStore
 ) -> dict[str, Any]:
     cached = state.get("bootloader", {})
-    now = time.time()
     checked_at = cached.get("checked_at")
-    if isinstance(checked_at, str):
-        checked_epoch = parse_iso_timestamp(checked_at)
-    else:
-        checked_epoch = 0
-
-    if cached and checked_epoch and (now - checked_epoch) < BOOTLOADER_CHECK_INTERVAL_SECONDS:
+    if cached and isinstance(checked_at, str) and not is_bootloader_check_due(checked_at):
         return cached
 
+    now = time.time()
     current_status = detect_raspberry_bootloader_status(config)
     chip, track = detect_raspberry_chip_and_track(config)
     eeprom_config = get_rpi_eeprom_config_status(config, chip, track)
@@ -2134,6 +2131,40 @@ def collect_raspberry_bootloader_status(
         chip,
     )
     return payload
+
+
+def is_apt_check_due(checked_at: str | None) -> bool:
+    scheduled = latest_local_schedule(hour=0, minute=0)
+    if scheduled is None:
+        return True
+    checked_epoch = parse_iso_timestamp(checked_at) if isinstance(checked_at, str) else 0.0
+    return checked_epoch < scheduled.timestamp()
+
+
+def is_bootloader_check_due(checked_at: str | None) -> bool:
+    scheduled = latest_local_weekday_schedule(weekday=6, hour=0, minute=0)
+    if scheduled is None:
+        return True
+    checked_epoch = parse_iso_timestamp(checked_at) if isinstance(checked_at, str) else 0.0
+    return checked_epoch < scheduled.timestamp()
+
+
+def latest_local_schedule(*, hour: int, minute: int) -> datetime | None:
+    now = datetime.now().astimezone()
+    scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now < scheduled:
+        scheduled = scheduled - timedelta(days=1)
+    return scheduled
+
+
+def latest_local_weekday_schedule(*, weekday: int, hour: int, minute: int) -> datetime | None:
+    now = datetime.now().astimezone()
+    scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    days_back = (scheduled.weekday() - weekday) % 7
+    scheduled = scheduled - timedelta(days=days_back)
+    if now < scheduled:
+        scheduled = scheduled - timedelta(days=7)
+    return scheduled
 
 
 def detect_raspberry_chip_and_track(config: AgentConfig) -> tuple[str | None, str]:

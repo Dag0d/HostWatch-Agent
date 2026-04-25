@@ -45,10 +45,10 @@ The agent configuration file is self-healing:
 
 - the runtime always normalizes `agent.json` to the current supported schema
 - missing fields are written back automatically with defaults
-- invalid or incomplete VPN recovery settings fall back safely to `local`
 - older configs keep working without manual migration steps
 
 When `python3 hostwatch_agent.py config` or `python3 hostwatch_agent.py config --guided` saves changes on a systemd-based host, the tool also tries to restart `hostwatch-agent.service` immediately so the new configuration becomes active without a manual reboot.
+Saving now validates the full configuration first and prints clear errors if required fields are missing, for example when `connectionStyle` is set to `vpn` without a tunnel name or health host.
 
 An update with `--update` stops a running `hostwatch-agent.service`, replaces the agent, wrapper, and systemd unit, keeps `/etc/hostwatch/agent.json` and `/var/lib/hostwatch/agent.state.json` unchanged, and starts the service again afterwards. It does not trigger a new pairing flow.
 
@@ -95,7 +95,7 @@ sudo ./install.sh --no-enable
 The agent has two configuration experiences:
 
 - `python3 hostwatch_agent.py config`
-  Opens a persistent text menu for editing existing settings.
+  Opens an interactive terminal UI for editing existing settings.
 - `python3 hostwatch_agent.py config --guided`
   Runs the guided question flow.
 

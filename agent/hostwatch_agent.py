@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import curses
+import curses.textpad
 import fcntl
 import hashlib
 import json
@@ -17,6 +19,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -30,7 +33,7 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "2026.4.5"
+AGENT_VERSION = "2026.4.6"
 DEFAULT_CONFIG_PATH = Path(os.environ.get("HOSTWATCH_CONFIG_PATH", "/etc/hostwatch/agent.json"))
 DEFAULT_STATE_PATH = Path(os.environ.get("HOSTWATCH_STATE_PATH", str(DEFAULT_CONFIG_PATH.with_suffix(".state.json"))))
 DEFAULT_SERVICE_NAME = os.environ.get("HOSTWATCH_SERVICE_NAME", "hostwatch-agent.service")
@@ -106,6 +109,14 @@ class AgentConfig:
 class ConfigField:
     key: str
     label: str
+    kind: str = "text"
+    choices: tuple[str, ...] | None = None
+
+
+class ConfigValidationError(ValueError):
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("\n".join(errors))
+        self.errors = errors
 
 
 @dataclass
@@ -676,11 +687,17 @@ def load_config() -> AgentConfig:
         )
     )
     if config_to_payload(config) != data:
-        save_config(config)
+        try:
+            save_config(config)
+        except ConfigValidationError as exc:
+            LOGGER.warning("Config auto-heal skipped because the current config is invalid: %s", "; ".join(exc.errors))
     return config
 
 
 def save_config(config: AgentConfig) -> None:
+    errors = validate_agent_config(config)
+    if errors:
+        raise ConfigValidationError(errors)
     DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = config_to_payload(config)
     DEFAULT_CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf8")
@@ -717,6 +734,27 @@ def config_to_payload(config: AgentConfig) -> dict[str, Any]:
     }
 
 
+def validate_agent_config_details(config: AgentConfig) -> list[tuple[str, str]]:
+    normalized = normalize_agent_config(config)
+    errors: list[tuple[str, str]] = []
+    if normalized.temperature_source == "path" and not normalized.temperature_path:
+        errors.append(("temperature_path", "Temperature source 'path' requires a temperature file path."))
+    if normalized.connection_style == "vpn":
+        if not normalized.vpn_type:
+            errors.append(("vpn_type", "VPN connection style requires a VPN type."))
+        if not normalized.vpn_name:
+            errors.append(("vpn_name", "VPN connection style requires a VPN connection name/interface."))
+        elif not re.fullmatch(r"[A-Za-z0-9_.@-]+", normalized.vpn_name):
+            errors.append(("vpn_name", "VPN connection name/interface may contain only letters, digits, '.', '_', '@', and '-'."))
+        if not normalized.vpn_health_host:
+            errors.append(("vpn_health_host", "VPN connection style requires a VPN health host or IP address."))
+    return errors
+
+
+def validate_agent_config(config: AgentConfig) -> list[str]:
+    return [message for _key, message in validate_agent_config_details(config)]
+
+
 def normalize_agent_config(config: AgentConfig) -> AgentConfig:
     node_name = normalize_text_value(config.node_name, default_node_name())
     node_uid = normalize_text_value(config.node_uid, stable_node_uid())
@@ -736,7 +774,7 @@ def normalize_agent_config(config: AgentConfig) -> AgentConfig:
     vpn_max_reboots_per_day = max(0, parse_int_value(config.vpn_max_reboots_per_day, 1))
     if temperature_source != "path":
         temperature_path = None
-    if connection_style != "vpn" or vpn_type is None or vpn_name is None or vpn_health_host is None:
+    if connection_style != "vpn":
         connection_style = "local"
         vpn_type = None
         vpn_name = None
@@ -2811,7 +2849,18 @@ def configure_agent_guided(config: AgentConfig) -> None:
     current = normalize_agent_config(config)
     print(f"Config file: {DEFAULT_CONFIG_PATH}")
     for field in CONFIG_FIELDS:
+        if not is_config_field_visible(current, field.key):
+            continue
         current = edit_config_field(current, field.key, guided=True)
+    while True:
+        details = validate_agent_config_details(current)
+        if not details:
+            break
+        field_key, message = details[0]
+        print("Configuration not saved:")
+        print(f"- {message}")
+        print(f"Re-opening: {next((field.label for field in CONFIG_FIELDS if field.key == field_key), field_key)}")
+        current = edit_config_field(current, field_key, guided=True)
     save_config(current)
     LOGGER.info("Configuration saved")
     print("Configuration saved.")
@@ -2819,20 +2868,37 @@ def configure_agent_guided(config: AgentConfig) -> None:
 
 
 def configure_agent(config: AgentConfig) -> None:
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            configure_agent_tui(config)
+            return
+        except curses.error as exc:
+            LOGGER.warning("Falling back to plain config menu because the TUI failed: %s", exc)
+    configure_agent_text(config)
+
+
+def configure_agent_text(config: AgentConfig) -> None:
     current = normalize_agent_config(config)
     while True:
         print("")
         print("HostWatch agent configuration")
         print("-----------------------------")
         print(f"Config file: {DEFAULT_CONFIG_PATH}")
-        for index, field in enumerate(CONFIG_FIELDS, start=1):
+        fields = visible_config_fields(current)
+        for index, field in enumerate(fields, start=1):
             print(f"{index}. {field.label}: {config_field_display_value(current, field.key)}")
         print("")
         print("s. Save and exit")
         print("q. Quit without saving")
         choice = input("Select item to edit: ").strip().lower()
         if choice == "s":
-            save_config(current)
+            try:
+                save_config(current)
+            except ConfigValidationError as exc:
+                print("Configuration not saved:")
+                for error in exc.errors:
+                    print(f"- {error}")
+                continue
             LOGGER.info("Configuration saved")
             print("Configuration saved.")
             print(restart_agent_service_if_running())
@@ -2845,10 +2911,214 @@ def configure_agent(config: AgentConfig) -> None:
         except ValueError:
             print(f"Invalid choice: {choice}")
             continue
-        if index < 0 or index >= len(CONFIG_FIELDS):
+        if index < 0 or index >= len(fields):
             print(f"Invalid choice: {choice}")
             continue
-        current = edit_config_field(current, CONFIG_FIELDS[index].key, guided=False)
+        current = edit_config_field(current, fields[index].key, guided=False)
+
+
+def configure_agent_tui(config: AgentConfig) -> None:
+    state: dict[str, Any] = {"current": normalize_agent_config(config), "saved": False}
+
+    def run(stdscr: Any) -> None:
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        selected = 0
+        offset = 0
+        message = "Use arrows, Enter to edit, S to save, Q to quit"
+        while True:
+            current = state["current"]
+            fields = visible_config_fields(current)
+            if not fields:
+                return
+            selected = max(0, min(selected, len(fields) - 1))
+            height, width = stdscr.getmaxyx()
+            list_top = 4
+            list_height = max(5, height - 8)
+            if selected < offset:
+                offset = selected
+            if selected >= offset + list_height:
+                offset = selected - list_height + 1
+
+            stdscr.erase()
+            stdscr.addstr(0, 2, "HostWatch Agent Configuration", curses.A_BOLD)
+            stdscr.addstr(1, 2, f"Config file: {DEFAULT_CONFIG_PATH}")
+            stdscr.addstr(height - 2, 2, truncate_text(message, width - 4))
+            stdscr.addstr(height - 1, 2, "Enter edit  S save  Q quit  Up/Down move")
+
+            for row, field in enumerate(fields[offset:offset + list_height], start=list_top):
+                index = offset + (row - list_top)
+                label = truncate_text(field.label, max(10, width // 2 - 4))
+                value = truncate_text(config_field_display_value(current, field.key), max(10, width - (width // 2) - 6))
+                attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                stdscr.addstr(row, 2, label.ljust(max(10, width // 2 - 4)), attr)
+                stdscr.addstr(row, width // 2, value, attr)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                return
+            if key in (ord("s"), ord("S"), curses.KEY_F2):
+                try:
+                    save_config(state["current"])
+                except ConfigValidationError as exc:
+                    tui_message_box(stdscr, "Configuration not saved", exc.errors)
+                    message = exc.errors[0]
+                    continue
+                LOGGER.info("Configuration saved")
+                restart_message = restart_agent_service_if_running()
+                tui_message_box(stdscr, "Configuration saved", [restart_message])
+                state["saved"] = True
+                return
+            if key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+                continue
+            if key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(fields) - 1, selected + 1)
+                continue
+            if key in (10, 13, curses.KEY_ENTER):
+                updated, feedback = tui_edit_config_field(stdscr, state["current"], fields[selected])
+                state["current"] = updated
+                if feedback:
+                    message = feedback
+
+    curses.wrapper(run)
+    if not state["saved"]:
+        print("Configuration unchanged.")
+
+
+def tui_edit_config_field(stdscr: Any, config: AgentConfig, field: ConfigField) -> tuple[AgentConfig, str | None]:
+    current_value = config_field_display_value(config, field.key)
+    if field.kind == "choice" and field.choices:
+        selected = tui_select_option(stdscr, field.label, field.choices, getattr(config, field.key, None) or field.choices[0])
+        if selected is None:
+            return config, None
+        return apply_config_field_value(config, field.key, selected)
+    if field.kind == "int":
+        entered = tui_input_box(stdscr, field.label, current_value)
+        if entered is None:
+            return config, None
+        if not entered.strip():
+            entered = current_value
+        if not entered.strip().isdigit():
+            tui_message_box(stdscr, "Invalid value", ["Please enter a valid non-negative integer."])
+            return config, "Please enter a valid non-negative integer."
+        return apply_config_field_value(config, field.key, int(entered.strip()))
+    if field.kind == "csv":
+        entered = tui_input_box(stdscr, field.label, ", ".join(config.extra_interfaces or []))
+        if entered is None:
+            return config, None
+        values = [item.strip() for item in entered.split(",") if item.strip()]
+        return apply_config_field_value(config, field.key, values)
+    defaults: dict[str, str] = {
+        "temperature_path": config.temperature_path or "/sys/class/thermal/thermal_zone0/temp",
+        "vpn_name": config.vpn_name or ("wg0" if config.vpn_type == "wireguard" else "client"),
+        "internet_health_host": config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST,
+    }
+    entered = tui_input_box(stdscr, field.label, defaults.get(field.key, current_value if current_value != "none" else ""))
+    if entered is None:
+        return config, None
+    return apply_config_field_value(config, field.key, entered)
+
+
+def tui_select_option(stdscr: Any, title: str, options: tuple[str, ...], current: str) -> str | None:
+    selected = max(0, options.index(current)) if current in options else 0
+    while True:
+        height = min(len(options) + 6, 16)
+        width = max(40, len(title) + 6, max(len(option) for option in options) + 8)
+        win = tui_centered_window(stdscr, height, width)
+        win.keypad(True)
+        win.addstr(1, 2, title, curses.A_BOLD)
+        win.addstr(height - 2, 2, "Enter select  Esc cancel")
+        for index, option in enumerate(options, start=0):
+            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+            win.addstr(3 + index, 2, option, attr)
+        win.refresh()
+        key = win.getch()
+        if key in (27, ord("q"), ord("Q")):
+            return None
+        if key in (curses.KEY_UP, ord("k")):
+            selected = max(0, selected - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = min(len(options) - 1, selected + 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            return options[selected]
+
+
+def tui_input_box(stdscr: Any, title: str, default: str) -> str | None:
+    height = 8
+    width = max(60, min(100, len(title) + 20, len(default) + 20))
+    win = tui_centered_window(stdscr, height, width)
+    win.addstr(1, 2, title, curses.A_BOLD)
+    win.addstr(height - 2, 2, "Enter save  Esc cancel")
+    edit = curses.newwin(1, width - 4, (stdscr.getmaxyx()[0] - height) // 2 + 3, (stdscr.getmaxyx()[1] - width) // 2 + 2)
+    edit.keypad(True)
+    buffer = list(default)
+    cursor = len(buffer)
+    curses.curs_set(1)
+    try:
+        while True:
+            win.refresh()
+            edit.erase()
+            visible = "".join(buffer)
+            edit.addstr(0, 0, truncate_text(visible, width - 5))
+            edit.move(0, min(cursor, width - 5))
+            edit.refresh()
+            key = edit.getch()
+            if key == 27:
+                return None
+            if key in (10, 13, curses.KEY_ENTER):
+                return "".join(buffer)
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                if cursor > 0:
+                    cursor -= 1
+                    del buffer[cursor]
+                continue
+            if key in (curses.KEY_LEFT,):
+                cursor = max(0, cursor - 1)
+                continue
+            if key in (curses.KEY_RIGHT,):
+                cursor = min(len(buffer), cursor + 1)
+                continue
+            if 32 <= key <= 126:
+                buffer.insert(cursor, chr(key))
+                cursor += 1
+    finally:
+        curses.curs_set(0)
+
+
+def tui_message_box(stdscr: Any, title: str, lines: list[str]) -> None:
+    wrapped = lines[:]
+    height = min(max(6, len(wrapped) + 4), max(8, stdscr.getmaxyx()[0] - 2))
+    width = min(max(40, max((len(line) for line in wrapped), default=0) + 4, len(title) + 6), max(42, stdscr.getmaxyx()[1] - 2))
+    win = tui_centered_window(stdscr, height, width)
+    win.addstr(1, 2, title, curses.A_BOLD)
+    for index, line in enumerate(wrapped[: height - 4], start=2):
+        win.addstr(index, 2, truncate_text(line, width - 4))
+    win.addstr(height - 2, 2, "Press any key to continue")
+    win.refresh()
+    win.getch()
+
+
+def tui_centered_window(stdscr: Any, height: int, width: int) -> Any:
+    max_y, max_x = stdscr.getmaxyx()
+    height = min(height, max_y - 2)
+    width = min(width, max_x - 2)
+    start_y = max(1, (max_y - height) // 2)
+    start_x = max(1, (max_x - width) // 2)
+    win = curses.newwin(height, width, start_y, start_x)
+    win.box()
+    return win
+
+
+def truncate_text(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."
 
 
 def prompt_text(label: str, default: str) -> str:
@@ -2892,140 +3162,214 @@ def prompt_int(label: str, current: int, *, minimum: int = 0) -> int:
 
 CONFIG_FIELDS: tuple[ConfigField, ...] = (
     ConfigField("node_name", "Node name"),
-    ConfigField("ha_url_mode", "Home Assistant URL mode"),
-    ConfigField("hardware_profile", "Hardware profile"),
+    ConfigField("ha_url_mode", "Home Assistant URL mode", "choice", ("local", "external")),
+    ConfigField("hardware_profile", "Hardware profile", "choice", ("auto", "physical", "vm", "raspberry_pi")),
     ConfigField("raspberry_model_override", "Raspberry Pi model override"),
-    ConfigField("temperature_source", "Temperature source"),
+    ConfigField("temperature_source", "Temperature source", "choice", ("auto", "none", "path")),
     ConfigField("temperature_path", "Temperature file path"),
     ConfigField("primary_interface", "Primary network interface"),
-    ConfigField("extra_interfaces", "Additional network interfaces"),
-    ConfigField("connection_style", "Connection style"),
-    ConfigField("vpn_type", "VPN type"),
+    ConfigField("extra_interfaces", "Additional network interfaces", "csv"),
+    ConfigField("connection_style", "Connection style", "choice", ("local", "vpn")),
+    ConfigField("vpn_type", "VPN type", "choice", ("wireguard", "openvpn")),
     ConfigField("vpn_name", "VPN connection name/interface"),
     ConfigField("vpn_health_host", "VPN health host"),
     ConfigField("internet_health_host", "Internet health host"),
-    ConfigField("vpn_retries_before_reboot", "Reconnect attempts before reboot"),
-    ConfigField("vpn_max_reboots_per_day", "Maximum automatic reboots per day"),
+    ConfigField("vpn_retries_before_reboot", "Reconnect attempts before reboot", "int"),
+    ConfigField("vpn_max_reboots_per_day", "Maximum automatic reboots per day", "int"),
 )
 
 
-def edit_config_field(config: AgentConfig, key: str, *, guided: bool) -> AgentConfig:
+def is_config_field_visible(config: AgentConfig, key: str) -> bool:
+    if key == "temperature_path":
+        return config.temperature_source == "path"
+    if key in {
+        "vpn_type",
+        "vpn_name",
+        "vpn_health_host",
+        "internet_health_host",
+        "vpn_retries_before_reboot",
+        "vpn_max_reboots_per_day",
+    }:
+        return config.connection_style == "vpn"
+    return True
+
+
+def visible_config_fields(config: AgentConfig) -> list[ConfigField]:
+    return [field for field in CONFIG_FIELDS if is_config_field_visible(config, field.key)]
+
+
+def apply_config_field_value(config: AgentConfig, key: str, value: Any) -> tuple[AgentConfig, str | None]:
     if key == "node_name":
-        return replace_config(config, node_name=prompt_text("Node name", config.node_name))
+        return replace_config(config, node_name=str(value).strip() or config.node_name), None
     if key == "ha_url_mode":
-        return replace_config(
-            config,
-            ha_url_mode=prompt_choice(
-                "Home Assistant URL mode for pairing/webhooks",
-                config.ha_url_mode,
-                ("local", "external"),
-            ),
-        )
+        return replace_config(config, ha_url_mode=value), None
     if key == "hardware_profile":
-        return replace_config(
-            config,
-            hardware_profile=prompt_choice(
-                "Hardware profile",
-                config.hardware_profile,
-                ("auto", "physical", "vm", "raspberry_pi"),
-            ),
-        )
+        return replace_config(config, hardware_profile=value), None
     if key == "raspberry_model_override":
-        value = prompt_text("Raspberry Pi model override (blank for auto/none)", config.raspberry_model_override or "").strip() or None
-        return replace_config(config, raspberry_model_override=value)
+        return replace_config(config, raspberry_model_override=(str(value).strip() or None)), None
     if key == "temperature_source":
-        source = prompt_choice("Temperature source", config.temperature_source, ("auto", "none", "path"))
+        source = str(value).strip()
         next_path = config.temperature_path if source == "path" else None
-        return replace_config(config, temperature_source=source, temperature_path=next_path)
+        return replace_config(config, temperature_source=source, temperature_path=next_path), None
     if key == "temperature_path":
         if config.temperature_source != "path":
-            if not guided:
-                print("Set temperature source to 'path' first.")
-            return config
-        value = prompt_text("Temperature file path", config.temperature_path or "/sys/class/thermal/thermal_zone0/temp").strip() or None
-        return replace_config(config, temperature_path=value)
+            return config, "Set temperature source to 'path' first."
+        return replace_config(config, temperature_path=(str(value).strip() or None)), None
     if key == "primary_interface":
-        value = prompt_text(
-            "Primary network interface for discovery/IP display (auto or interface name)",
-            config.primary_interface,
-        ).strip() or "auto"
-        return replace_config(config, primary_interface=value)
+        return replace_config(config, primary_interface=(str(value).strip() or "auto")), None
     if key == "extra_interfaces":
-        return replace_config(
-            config,
-            extra_interfaces=prompt_csv(
-                "Additional network interfaces for IP display (comma separated, blank for none)",
-                config.extra_interfaces or [],
-            ),
-        )
+        return replace_config(config, extra_interfaces=value), None
     if key == "connection_style":
-        value = prompt_choice("Connection style", config.connection_style, ("local", "vpn"))
-        updates: dict[str, Any] = {"connection_style": value}
-        if value == "local":
+        chosen = str(value).strip()
+        updates: dict[str, Any] = {"connection_style": chosen}
+        if chosen == "local":
             updates.update(
                 {
                     "vpn_type": None,
                     "vpn_name": None,
+                    "vpn_health_host": None,
+                    "internet_health_host": DEFAULT_INTERNET_HEALTH_HOST,
                     "vpn_retries_before_reboot": 0,
                     "vpn_max_reboots_per_day": 1,
                 }
             )
         elif config.vpn_type is None:
             updates["vpn_type"] = "wireguard"
-        return replace_config(config, **updates)
+        return replace_config(config, **updates), None
     if key == "vpn_type":
         if config.connection_style != "vpn":
-            if not guided:
-                print("Set connection style to 'vpn' first.")
-            return config
-        return replace_config(
-            config,
-            vpn_type=prompt_choice("VPN type", config.vpn_type or "wireguard", ("wireguard", "openvpn")),
-        )
+            return config, "Set connection style to 'vpn' first."
+        return replace_config(config, vpn_type=value), None
     if key == "vpn_name":
         if config.connection_style != "vpn":
-            if not guided:
-                print("Set connection style to 'vpn' first.")
-            return config
-        default_name = config.vpn_name or ("wg0" if config.vpn_type == "wireguard" else "client")
-        value = prompt_text("VPN connection name/interface", default_name).strip() or None
-        return replace_config(config, vpn_name=value)
+            return config, "Set connection style to 'vpn' first."
+        return replace_config(config, vpn_name=(str(value).strip() or None)), None
     if key == "vpn_health_host":
         if config.connection_style != "vpn":
-            if not guided:
-                print("Set connection style to 'vpn' first.")
-            return config
-        value = prompt_text("VPN health host or IP address", config.vpn_health_host or "").strip() or None
-        return replace_config(config, vpn_health_host=value)
+            return config, "Set connection style to 'vpn' first."
+        return replace_config(config, vpn_health_host=(str(value).strip() or None)), None
     if key == "internet_health_host":
         if config.connection_style != "vpn":
-            if not guided:
-                print("Set connection style to 'vpn' first.")
-            return config
-        value = prompt_text("Internet health host or IP address", config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST).strip() or DEFAULT_INTERNET_HEALTH_HOST
-        return replace_config(config, internet_health_host=value)
+            return config, "Set connection style to 'vpn' first."
+        return replace_config(config, internet_health_host=(str(value).strip() or DEFAULT_INTERNET_HEALTH_HOST)), None
     if key == "vpn_retries_before_reboot":
         if config.connection_style != "vpn":
-            if not guided:
-                print("Set connection style to 'vpn' first.")
-            return config
-        value = prompt_int(
-            "Reconnect attempts before automatic reboot (0 disables reboot)",
-            config.vpn_retries_before_reboot,
-            minimum=0,
-        )
-        return replace_config(config, vpn_retries_before_reboot=value)
+            return config, "Set connection style to 'vpn' first."
+        return replace_config(config, vpn_retries_before_reboot=max(0, parse_int_value(value, config.vpn_retries_before_reboot))), None
     if key == "vpn_max_reboots_per_day":
         if config.connection_style != "vpn":
-            if not guided:
-                print("Set connection style to 'vpn' first.")
-            return config
-        value = prompt_int(
-            "Maximum automatic reboots per day (0 disables the daily limit)",
-            config.vpn_max_reboots_per_day,
-            minimum=0,
+            return config, "Set connection style to 'vpn' first."
+        return replace_config(config, vpn_max_reboots_per_day=max(0, parse_int_value(value, config.vpn_max_reboots_per_day))), None
+    return config, None
+
+
+def edit_config_field(config: AgentConfig, key: str, *, guided: bool) -> AgentConfig:
+    if key == "node_name":
+        updated, message = apply_config_field_value(config, key, prompt_text("Node name", config.node_name))
+        if message and not guided:
+            print(message)
+        return updated
+    if key == "ha_url_mode":
+        updated, _ = apply_config_field_value(
+            config,
+            key,
+            prompt_choice("Home Assistant URL mode for pairing/webhooks", config.ha_url_mode, ("local", "external")),
         )
-        return replace_config(config, vpn_max_reboots_per_day=value)
+        return updated
+    if key == "hardware_profile":
+        updated, _ = apply_config_field_value(
+            config,
+            key,
+            prompt_choice("Hardware profile", config.hardware_profile, ("auto", "physical", "vm", "raspberry_pi")),
+        )
+        return updated
+    if key == "raspberry_model_override":
+        updated, _ = apply_config_field_value(
+            config,
+            key,
+            prompt_text("Raspberry Pi model override (blank for auto/none)", config.raspberry_model_override or ""),
+        )
+        return updated
+    if key == "temperature_source":
+        updated, _ = apply_config_field_value(
+            config,
+            key,
+            prompt_choice("Temperature source", config.temperature_source, ("auto", "none", "path")),
+        )
+        return updated
+    if key == "temperature_path":
+        updated, message = apply_config_field_value(
+            config,
+            key,
+            prompt_text("Temperature file path", config.temperature_path or "/sys/class/thermal/thermal_zone0/temp"),
+        )
+        if message and not guided:
+            print(message)
+        return updated
+    if key == "primary_interface":
+        updated, _ = apply_config_field_value(
+            config,
+            key,
+            prompt_text("Primary network interface for discovery/IP display (auto or interface name)", config.primary_interface),
+        )
+        return updated
+    if key == "extra_interfaces":
+        updated, _ = apply_config_field_value(
+            config,
+            key,
+            prompt_csv("Additional network interfaces for IP display (comma separated, blank for none)", config.extra_interfaces or []),
+        )
+        return updated
+    if key == "connection_style":
+        updated, _ = apply_config_field_value(config, key, prompt_choice("Connection style", config.connection_style, ("local", "vpn")))
+        return updated
+    if key == "vpn_type":
+        updated, message = apply_config_field_value(
+            config,
+            key,
+            prompt_choice("VPN type", config.vpn_type or "wireguard", ("wireguard", "openvpn")),
+        )
+        if message and not guided:
+            print(message)
+        return updated
+    if key == "vpn_name":
+        default_name = config.vpn_name or ("wg0" if config.vpn_type == "wireguard" else "client")
+        updated, message = apply_config_field_value(config, key, prompt_text("VPN connection name/interface", default_name))
+        if message and not guided:
+            print(message)
+        return updated
+    if key == "vpn_health_host":
+        updated, message = apply_config_field_value(config, key, prompt_text("VPN health host or IP address", config.vpn_health_host or ""))
+        if message and not guided:
+            print(message)
+        return updated
+    if key == "internet_health_host":
+        updated, message = apply_config_field_value(
+            config,
+            key,
+            prompt_text("Internet health host or IP address", config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST),
+        )
+        if message and not guided:
+            print(message)
+        return updated
+    if key == "vpn_retries_before_reboot":
+        updated, message = apply_config_field_value(
+            config,
+            key,
+            prompt_int("Reconnect attempts before automatic reboot (0 disables reboot)", config.vpn_retries_before_reboot, minimum=0),
+        )
+        if message and not guided:
+            print(message)
+        return updated
+    if key == "vpn_max_reboots_per_day":
+        updated, message = apply_config_field_value(
+            config,
+            key,
+            prompt_int("Maximum automatic reboots per day (0 disables the daily limit)", config.vpn_max_reboots_per_day, minimum=0),
+        )
+        if message and not guided:
+            print(message)
+        return updated
     return config
 
 

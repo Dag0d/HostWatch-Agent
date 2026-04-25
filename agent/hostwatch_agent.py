@@ -30,7 +30,7 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "2026.4.4"
+AGENT_VERSION = "2026.4.5"
 DEFAULT_CONFIG_PATH = Path(os.environ.get("HOSTWATCH_CONFIG_PATH", "/etc/hostwatch/agent.json"))
 DEFAULT_STATE_PATH = Path(os.environ.get("HOSTWATCH_STATE_PATH", str(DEFAULT_CONFIG_PATH.with_suffix(".state.json"))))
 DEFAULT_SERVICE_NAME = os.environ.get("HOSTWATCH_SERVICE_NAME", "hostwatch-agent.service")
@@ -41,6 +41,10 @@ COMMAND_POLL_INTERVAL_SECONDS = int(os.environ.get("HOSTWATCH_COMMAND_POLL_INTER
 PAIRING_TIMEOUT_SECONDS = 300
 BOOTLOADER_CHECK_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 APT_UPDATE_FRESH_SECONDS = 30 * 60
+VPN_RECOVERY_FAILURE_THRESHOLD = int(os.environ.get("HOSTWATCH_VPN_RECOVERY_FAILURE_THRESHOLD", "3"))
+VPN_RECOVERY_COOLDOWN_SECONDS = int(os.environ.get("HOSTWATCH_VPN_RECOVERY_COOLDOWN_SECONDS", "45"))
+VPN_INTERNET_DOWN_RECHECK_SECONDS = int(os.environ.get("HOSTWATCH_VPN_INTERNET_DOWN_RECHECK_SECONDS", "300"))
+DEFAULT_INTERNET_HEALTH_HOST = os.environ.get("HOSTWATCH_INTERNET_HEALTH_HOST", "8.8.8.8")
 RPI_NOTES_URL_TEMPLATE = "https://raw.githubusercontent.com/raspberrypi/rpi-eeprom/refs/heads/master/firmware-{chip}/release-notes.md"
 RPI_EEPROM_TARBALL_URL = "https://github.com/raspberrypi/rpi-eeprom/archive/refs/heads/master.tar.gz"
 RPI_EEPROM_DEST_ROOT = Path("/lib/firmware/raspberrypi")
@@ -89,6 +93,19 @@ class AgentConfig:
     temperature_path: str | None = None
     primary_interface: str = "auto"
     extra_interfaces: list[str] | None = None
+    connection_style: str = "local"
+    vpn_type: str | None = None
+    vpn_name: str | None = None
+    vpn_health_host: str | None = None
+    internet_health_host: str | None = DEFAULT_INTERNET_HEALTH_HOST
+    vpn_retries_before_reboot: int = 0
+    vpn_max_reboots_per_day: int = 1
+
+
+@dataclass(frozen=True)
+class ConfigField:
+    key: str
+    label: str
 
 
 @dataclass
@@ -180,6 +197,145 @@ class CommandOutputStore:
             meta_path.unlink(missing_ok=True)
 
 
+class VpnRecoveryManager:
+    """Track HA connectivity and optionally recover a configured VPN tunnel."""
+
+    def __init__(self, config: AgentConfig, state: AgentStateStore) -> None:
+        self.config = config
+        self._state = state
+        self._consecutive_failures = 0
+        self._reconnect_attempts_since_success = 0
+        self._last_recovery_attempt_at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.config.connection_style == "vpn"
+            and bool(self.config.vpn_type)
+            and bool(self.config.vpn_name)
+            and bool(self.config.vpn_health_host)
+        )
+
+    def record_success(self) -> None:
+        if not self.enabled:
+            return
+        self._consecutive_failures = 0
+        self._reconnect_attempts_since_success = 0
+
+    def record_failure(self, kind: str, exc: Exception) -> None:
+        if not self.enabled or SHUTDOWN_EVENT.is_set():
+            return
+        self._consecutive_failures += 1
+        if self._consecutive_failures < VPN_RECOVERY_FAILURE_THRESHOLD:
+            return
+        now = time.time()
+        payload = self._current_payload(now)
+        last_diagnosis_at = parse_iso_timestamp(str(payload.get("last_diagnosis_at") or ""))
+        connectivity_state = str(payload.get("connectivity_state") or "unknown")
+        if connectivity_state == "internet_down" and last_diagnosis_at and now - last_diagnosis_at < VPN_INTERNET_DOWN_RECHECK_SECONDS:
+            return
+        if connectivity_state != "internet_down" and self._last_recovery_attempt_at and now - self._last_recovery_attempt_at < VPN_RECOVERY_COOLDOWN_SECONDS:
+            return
+        self._last_recovery_attempt_at = now
+        self._consecutive_failures = 0
+        self._attempt_recovery(kind, exc)
+
+    def metrics_payload(self) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        existing = self._state.get("vpn_recovery", {})
+        payload = self._current_payload(time.time())
+        if payload != existing:
+            self._state.set("vpn_recovery", payload)
+        if not isinstance(payload, dict):
+            return None
+        return {
+            "reconnects_today": payload.get("reconnects_today", 0),
+            "last_reconnect_at": payload.get("last_reconnect_at"),
+        }
+
+    def _attempt_recovery(self, kind: str, exc: Exception) -> None:
+        now = time.time()
+        payload = self._current_payload(now)
+        payload["last_diagnosis_at"] = iso_timestamp(now)
+        health_host = self.config.vpn_health_host
+        if not health_host:
+            return
+        if ping_host(health_host):
+            payload["connectivity_state"] = "ha_failed"
+            self._state.set("vpn_recovery", payload)
+            LOGGER.warning(
+                "HA connectivity failed via %s (%s), but VPN health host %s is reachable; skipping VPN recovery",
+                kind,
+                exc,
+                health_host,
+            )
+            return
+
+        internet_ok_without_vpn = test_internet_without_vpn(self.config)
+        if not internet_ok_without_vpn:
+            payload["connectivity_state"] = "internet_down"
+            self._state.set("vpn_recovery", payload)
+            LOGGER.warning(
+                "HA connectivity failed via %s (%s) and internet host %s is unreachable without the tunnel; skipping VPN recovery for now",
+                kind,
+                exc,
+                self.config.internet_health_host,
+            )
+            return
+
+        if self.config.vpn_retries_before_reboot > 0 and self._reconnect_attempts_since_success >= self.config.vpn_retries_before_reboot:
+            self._maybe_reboot_after_failed_retries(kind, exc)
+            return
+
+        payload["connectivity_state"] = "vpn_suspect"
+        payload["last_reconnect_at"] = iso_timestamp(now)
+        payload["reconnects_today"] = int(payload.get("reconnects_today", 0)) + 1
+        self._state.set("vpn_recovery", payload)
+        self._reconnect_attempts_since_success += 1
+        LOGGER.warning(
+            "HA connectivity failed via %s (%s). VPN health host %s is unreachable, but internet without the tunnel works. A VPN reconnect cycle was attempted for %s '%s'",
+            kind,
+            exc,
+            health_host,
+            self.config.vpn_type,
+            self.config.vpn_name,
+        )
+
+    def _maybe_reboot_after_failed_retries(self, kind: str, exc: Exception) -> None:
+        now = time.time()
+        payload = self._current_payload(now)
+        if self.config.vpn_max_reboots_per_day > 0 and int(payload.get("auto_reboots_today", 0)) >= self.config.vpn_max_reboots_per_day:
+            LOGGER.warning(
+                "HA connectivity still failed via %s (%s), but the daily auto-reboot limit has been reached",
+                kind,
+                exc,
+            )
+            return
+        LOGGER.warning(
+            "HA connectivity still failed after %s VPN reconnect attempt(s); rebooting the node",
+            self._reconnect_attempts_since_success,
+        )
+        result = run_power_command(privileged_command(["systemctl", "reboot", "--no-block"]), "Automatic reboot triggered")
+        if result["status"] == "completed":
+            payload["last_auto_reboot_at"] = iso_timestamp(now)
+            payload["auto_reboots_today"] = int(payload.get("auto_reboots_today", 0)) + 1
+            self._state.set("vpn_recovery", payload)
+            SHUTDOWN_EVENT.set()
+        else:
+            LOGGER.warning("Automatic reboot failed: %s", result["message"].strip())
+
+    def _current_payload(self, now: float) -> dict[str, Any]:
+        existing = self._state.get("vpn_recovery", {})
+        payload = dict(existing) if isinstance(existing, dict) else {}
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        if payload.get("day") != today:
+            payload["day"] = today
+            payload["reconnects_today"] = 0
+            payload["auto_reboots_today"] = 0
+        return payload
+
+
 class DiscoveryHandle:
     def __init__(self, process: subprocess.Popen[str] | None, service_name: str | None) -> None:
         self._process = process
@@ -202,6 +358,7 @@ class SystemMetricsCollector:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
         self._state = AgentStateStore()
+        self._vpn_recovery = VpnRecoveryManager(config, self._state)
         self._previous_cpu: tuple[int, int] | None = None
         self._apt_cache_checked_at = 0.0
         self._apt_cache_count: int | None = None
@@ -217,6 +374,9 @@ class SystemMetricsCollector:
             "uptime_seconds": self._collect_uptime(),
             "bootloader": self._collect_bootloader(platform["capabilities"]["raspberryPiBootloader"]),
         }
+        vpn_recovery = self._vpn_recovery.metrics_payload()
+        if vpn_recovery:
+            metrics["vpn_recovery"] = vpn_recovery
         return {"metrics": metrics, "platform": platform["platform"]}
 
     def _collect_cpu(self) -> dict[str, Any]:
@@ -428,6 +588,13 @@ class PairingServer:
                         temperature_path=outer.config.temperature_path,
                         primary_interface=outer.config.primary_interface,
                         extra_interfaces=outer.config.extra_interfaces,
+                        connection_style=outer.config.connection_style,
+                        vpn_type=outer.config.vpn_type,
+                        vpn_name=outer.config.vpn_name,
+                        vpn_health_host=outer.config.vpn_health_host,
+                        internet_health_host=outer.config.internet_health_host,
+                        vpn_retries_before_reboot=outer.config.vpn_retries_before_reboot,
+                        vpn_max_reboots_per_day=outer.config.vpn_max_reboots_per_day,
                     )
                     save_config(next_config)
                     self._send_json(
@@ -480,7 +647,8 @@ def load_config() -> AgentConfig:
     if not DEFAULT_CONFIG_PATH.exists():
         return AgentConfig(node_name=default_node_name(), node_uid=stable_node_uid())
     data = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf8"))
-    return AgentConfig(
+    config = normalize_agent_config(
+        AgentConfig(
         node_name=data.get("nodeName", default_node_name()),
         node_uid=data.get("nodeUid", stable_node_uid()),
         ha_url=data.get("haUrl"),
@@ -498,32 +666,110 @@ def load_config() -> AgentConfig:
         temperature_path=data.get("temperaturePath"),
         primary_interface=data.get("primaryInterface", "auto"),
         extra_interfaces=data.get("extraInterfaces", []),
+        connection_style=data.get("connectionStyle", "local"),
+        vpn_type=data.get("vpnType"),
+        vpn_name=data.get("vpnName"),
+        vpn_health_host=data.get("vpnHealthHost"),
+        internet_health_host=data.get("internetHealthHost", DEFAULT_INTERNET_HEALTH_HOST),
+        vpn_retries_before_reboot=max(0, parse_int_value(data.get("vpnRetriesBeforeReboot"), 0)),
+        vpn_max_reboots_per_day=max(0, parse_int_value(data.get("vpnMaxRebootsPerDay"), 1)),
+        )
     )
+    if config_to_payload(config) != data:
+        save_config(config)
+    return config
 
 
 def save_config(config: AgentConfig) -> None:
     DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "nodeName": config.node_name,
-        "nodeUid": config.node_uid,
-        "haUrl": config.ha_url,
-        "haUrlMode": config.ha_url_mode,
-        "heartbeatWebhookUrl": config.heartbeat_webhook_url,
-        "metricsWebhookUrl": config.metrics_webhook_url,
-        "commandResultWebhookUrl": config.command_result_webhook_url,
-        "commandPollWebhookUrl": config.command_poll_webhook_url,
-        "nodeId": config.node_id,
-        "nodeSecret": config.node_secret,
-        "allowedHaName": config.allowed_ha_name,
-        "hardwareProfile": config.hardware_profile,
-        "raspberryModelOverride": config.raspberry_model_override,
-        "temperatureSource": config.temperature_source,
-        "temperaturePath": config.temperature_path,
-        "primaryInterface": config.primary_interface,
-        "extraInterfaces": config.extra_interfaces or [],
-    }
+    payload = config_to_payload(config)
     DEFAULT_CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf8")
     os.chmod(DEFAULT_CONFIG_PATH, 0o600)
+
+
+def config_to_payload(config: AgentConfig) -> dict[str, Any]:
+    normalized = normalize_agent_config(config)
+    return {
+        "nodeName": normalized.node_name,
+        "nodeUid": normalized.node_uid,
+        "haUrl": normalized.ha_url,
+        "haUrlMode": normalized.ha_url_mode,
+        "heartbeatWebhookUrl": normalized.heartbeat_webhook_url,
+        "metricsWebhookUrl": normalized.metrics_webhook_url,
+        "commandResultWebhookUrl": normalized.command_result_webhook_url,
+        "commandPollWebhookUrl": normalized.command_poll_webhook_url,
+        "nodeId": normalized.node_id,
+        "nodeSecret": normalized.node_secret,
+        "allowedHaName": normalized.allowed_ha_name,
+        "hardwareProfile": normalized.hardware_profile,
+        "raspberryModelOverride": normalized.raspberry_model_override,
+        "temperatureSource": normalized.temperature_source,
+        "temperaturePath": normalized.temperature_path,
+        "primaryInterface": normalized.primary_interface,
+        "extraInterfaces": normalized.extra_interfaces or [],
+        "connectionStyle": normalized.connection_style,
+        "vpnType": normalized.vpn_type,
+        "vpnName": normalized.vpn_name,
+        "vpnHealthHost": normalized.vpn_health_host,
+        "internetHealthHost": normalized.internet_health_host,
+        "vpnRetriesBeforeReboot": max(0, int(normalized.vpn_retries_before_reboot)),
+        "vpnMaxRebootsPerDay": max(0, int(normalized.vpn_max_reboots_per_day)),
+    }
+
+
+def normalize_agent_config(config: AgentConfig) -> AgentConfig:
+    node_name = normalize_text_value(config.node_name, default_node_name())
+    node_uid = normalize_text_value(config.node_uid, stable_node_uid())
+    ha_url_mode = normalize_choice_value(config.ha_url_mode, ("local", "external"), "local")
+    hardware_profile = normalize_choice_value(config.hardware_profile, ("auto", "physical", "vm", "raspberry_pi"), "auto")
+    temperature_source = normalize_choice_value(config.temperature_source, ("auto", "none", "path"), "auto")
+    temperature_path = normalize_optional_text(config.temperature_path)
+    primary_interface = normalize_text_value(config.primary_interface, "auto")
+    extra_interfaces = normalize_string_list(config.extra_interfaces)
+    raspberry_model_override = normalize_optional_text(config.raspberry_model_override)
+    connection_style = normalize_choice_value(config.connection_style, ("local", "vpn"), "local")
+    vpn_type = normalize_choice_value(config.vpn_type, ("wireguard", "openvpn"), None)
+    vpn_name = normalize_optional_text(config.vpn_name)
+    vpn_health_host = normalize_optional_text(config.vpn_health_host)
+    internet_health_host = normalize_text_value(config.internet_health_host, DEFAULT_INTERNET_HEALTH_HOST)
+    vpn_retries_before_reboot = max(0, parse_int_value(config.vpn_retries_before_reboot, 0))
+    vpn_max_reboots_per_day = max(0, parse_int_value(config.vpn_max_reboots_per_day, 1))
+    if temperature_source != "path":
+        temperature_path = None
+    if connection_style != "vpn" or vpn_type is None or vpn_name is None or vpn_health_host is None:
+        connection_style = "local"
+        vpn_type = None
+        vpn_name = None
+        vpn_health_host = None
+        internet_health_host = DEFAULT_INTERNET_HEALTH_HOST
+        vpn_retries_before_reboot = 0
+        vpn_max_reboots_per_day = 1
+    return AgentConfig(
+        node_name=node_name,
+        node_uid=node_uid,
+        ha_url=config.ha_url,
+        ha_url_mode=ha_url_mode,
+        heartbeat_webhook_url=config.heartbeat_webhook_url,
+        metrics_webhook_url=config.metrics_webhook_url,
+        command_result_webhook_url=config.command_result_webhook_url,
+        command_poll_webhook_url=config.command_poll_webhook_url,
+        node_id=config.node_id,
+        node_secret=config.node_secret,
+        allowed_ha_name=config.allowed_ha_name,
+        hardware_profile=hardware_profile,
+        raspberry_model_override=raspberry_model_override,
+        temperature_source=temperature_source,
+        temperature_path=temperature_path,
+        primary_interface=primary_interface,
+        extra_interfaces=extra_interfaces,
+        connection_style=connection_style,
+        vpn_type=vpn_type,
+        vpn_name=vpn_name,
+        vpn_health_host=vpn_health_host,
+        internet_health_host=internet_health_host,
+        vpn_retries_before_reboot=vpn_retries_before_reboot,
+        vpn_max_reboots_per_day=vpn_max_reboots_per_day,
+    )
 
 
 def normalize_version(value: str | None) -> str | None:
@@ -585,6 +831,7 @@ def detect_platform(config: AgentConfig) -> dict[str, Any]:
         },
         "platform": {
             "arch": os.uname().machine,
+            "connectionStyle": config.connection_style,
             "cpuModel": cpu_model,
             "cpuCores": os.cpu_count() or 1,
             "hostname": socket.gethostname(),
@@ -1216,10 +1463,11 @@ def run_agent(config: AgentConfig) -> None:
     signal.signal(signal.SIGTERM, stop_handler)
 
     collector = SystemMetricsCollector(config)
+    vpn_recovery = collector._vpn_recovery
     LOGGER.info("Agent started for node '%s'", config.node_name)
-    send_heartbeat(config)
-    send_metrics(config, collector.collect())
-    poll_commands(config, collector)
+    send_heartbeat(config, vpn_recovery)
+    send_metrics(config, collector.collect(), vpn_recovery)
+    poll_commands(config, collector, vpn_recovery)
 
     next_heartbeat = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS
     next_metrics = time.monotonic() + METRICS_INTERVAL_SECONDS
@@ -1228,29 +1476,33 @@ def run_agent(config: AgentConfig) -> None:
     while not stop_event.is_set():
         now = time.monotonic()
         if now >= next_heartbeat:
-            send_heartbeat(config)
+            send_heartbeat(config, vpn_recovery)
             next_heartbeat = now + HEARTBEAT_INTERVAL_SECONDS
         if now >= next_metrics:
-            send_metrics(config, collector.collect())
+            send_metrics(config, collector.collect(), vpn_recovery)
             next_metrics = now + METRICS_INTERVAL_SECONDS
         if now >= next_command_poll:
-            poll_commands(config, collector)
+            poll_commands(config, collector, vpn_recovery)
             next_command_poll = now + COMMAND_POLL_INTERVAL_SECONDS
         stop_event.wait(1)
     LOGGER.info("Agent stopped")
 
 
-def send_heartbeat(config: AgentConfig) -> None:
+def send_heartbeat(config: AgentConfig, vpn_recovery: VpnRecoveryManager | None = None) -> None:
     try:
         send_json(
             config.heartbeat_webhook_url,
             {"node_secret": config.node_secret},
         )
+        if vpn_recovery:
+            vpn_recovery.record_success()
     except (error.URLError, TimeoutError, OSError, HostWatchRequestError) as exc:
         report_request_failure("heartbeat", exc)
+        if vpn_recovery:
+            vpn_recovery.record_failure("heartbeat", exc)
 
 
-def send_metrics(config: AgentConfig, snapshot: dict[str, Any]) -> None:
+def send_metrics(config: AgentConfig, snapshot: dict[str, Any], vpn_recovery: VpnRecoveryManager | None = None) -> None:
     try:
         send_json(
             config.metrics_webhook_url,
@@ -1261,15 +1513,27 @@ def send_metrics(config: AgentConfig, snapshot: dict[str, Any]) -> None:
                 "agent_version": AGENT_VERSION,
             },
         )
+        if vpn_recovery:
+            vpn_recovery.record_success()
     except (error.URLError, TimeoutError, OSError, HostWatchRequestError) as exc:
         report_request_failure("metrics", exc)
+        if vpn_recovery:
+            vpn_recovery.record_failure("metrics", exc)
 
 
-def poll_commands(config: AgentConfig, collector: SystemMetricsCollector) -> None:
+def poll_commands(
+    config: AgentConfig,
+    collector: SystemMetricsCollector,
+    vpn_recovery: VpnRecoveryManager | None = None,
+) -> None:
     try:
         response = send_json(config.command_poll_webhook_url, {"node_secret": config.node_secret})
+        if vpn_recovery:
+            vpn_recovery.record_success()
     except (error.URLError, TimeoutError, OSError, HostWatchRequestError) as exc:
         report_request_failure("command poll", exc)
+        if vpn_recovery:
+            vpn_recovery.record_failure("command poll", exc)
         return
 
     command = response.get("command")
@@ -1837,6 +2101,87 @@ def privileged_command(argv: list[str]) -> list[str]:
     if sudo:
         return [sudo, "-n", *argv]
     return ["__hostwatch_root_required__", *argv]
+
+
+def build_vpn_restart_command(config: AgentConfig) -> list[str] | None:
+    """Return an allowlisted VPN restart command for the configured tunnel."""
+    if config.connection_style != "vpn" or not config.vpn_type or not config.vpn_name:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+", config.vpn_name):
+        return None
+    if config.vpn_type == "wireguard":
+        return privileged_command(["systemctl", "restart", f"wg-quick@{config.vpn_name}"])
+    if config.vpn_type == "openvpn":
+        return privileged_command(["systemctl", "restart", f"openvpn-client@{config.vpn_name}"])
+    return None
+
+
+def build_vpn_stop_command(config: AgentConfig) -> list[str] | None:
+    if config.connection_style != "vpn" or not config.vpn_type or not config.vpn_name:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+", config.vpn_name):
+        return None
+    if config.vpn_type == "wireguard":
+        return privileged_command(["systemctl", "stop", f"wg-quick@{config.vpn_name}"])
+    if config.vpn_type == "openvpn":
+        return privileged_command(["systemctl", "stop", f"openvpn-client@{config.vpn_name}"])
+    return None
+
+
+def build_vpn_start_command(config: AgentConfig) -> list[str] | None:
+    if config.connection_style != "vpn" or not config.vpn_type or not config.vpn_name:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+", config.vpn_name):
+        return None
+    if config.vpn_type == "wireguard":
+        return privileged_command(["systemctl", "start", f"wg-quick@{config.vpn_name}"])
+    if config.vpn_type == "openvpn":
+        return privileged_command(["systemctl", "start", f"openvpn-client@{config.vpn_name}"])
+    return None
+
+
+def ping_host(host: str, *, timeout_seconds: int = 3) -> bool:
+    target = (host or "").strip()
+    if not target:
+        return False
+    executable = shutil.which("ping")
+    if not executable:
+        return False
+    try:
+        result = subprocess.run(
+            [executable, "-c", "1", "-W", str(timeout_seconds), target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 2,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return False
+
+
+def test_internet_without_vpn(config: AgentConfig) -> bool:
+    """Temporarily stop the configured VPN, test internet reachability, and always bring it back."""
+    stop_command = build_vpn_stop_command(config)
+    start_command = build_vpn_start_command(config)
+    if stop_command is None or start_command is None:
+        LOGGER.warning("Cannot test internet without VPN because the tunnel commands are not available")
+        return False
+    stop_result = run_power_command(stop_command, f"Stopping {config.vpn_type} connection {config.vpn_name}")
+    if stop_result["status"] != "completed":
+        LOGGER.warning("Failed to stop VPN tunnel for internet diagnostics: %s", stop_result["message"].strip())
+        return False
+    internet_ok = False
+    try:
+        time.sleep(2)
+        internet_ok = ping_host(config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST)
+    finally:
+        start_result = run_power_command(start_command, f"Starting {config.vpn_type} connection {config.vpn_name}")
+        if start_result["status"] != "completed":
+            LOGGER.warning("Failed to restore VPN tunnel after internet diagnostics: %s", start_result["message"].strip())
+        else:
+            LOGGER.info("Restored VPN tunnel after connectivity diagnostics")
+    return internet_ok
 
 
 def run_power_command(command: list[str], success_message: str) -> dict[str, Any]:
@@ -2462,67 +2807,48 @@ def format_bootloader_check_output(bootloader: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def configure_agent(config: AgentConfig) -> None:
+def configure_agent_guided(config: AgentConfig) -> None:
+    current = normalize_agent_config(config)
     print(f"Config file: {DEFAULT_CONFIG_PATH}")
-    node_name = prompt_text("Node name", config.node_name)
-    ha_url_mode = prompt_choice(
-        "Home Assistant URL mode for pairing/webhooks",
-        config.ha_url_mode,
-        ("local", "external"),
-    )
-    hardware_profile = prompt_choice(
-        "Hardware profile",
-        config.hardware_profile,
-        ("auto", "physical", "vm", "raspberry_pi"),
-    )
-    raspberry_override = prompt_text(
-        "Raspberry Pi model override (blank for auto/none)",
-        config.raspberry_model_override or "",
-    ).strip() or None
-    temperature_source = prompt_choice(
-        "Temperature source",
-        config.temperature_source,
-        ("auto", "none", "path"),
-    )
-    temperature_path = config.temperature_path
-    if temperature_source == "path":
-        temperature_path = prompt_text(
-            "Temperature file path",
-            config.temperature_path or "/sys/class/thermal/thermal_zone0/temp",
-        ).strip() or None
-    else:
-        temperature_path = None
-    primary_interface = prompt_text(
-        "Primary network interface for discovery/IP display (auto or interface name)",
-        config.primary_interface,
-    ).strip() or "auto"
-    extra_interfaces = prompt_csv(
-        "Additional network interfaces for IP display (comma separated, blank for none)",
-        config.extra_interfaces or [],
-    )
-
-    next_config = AgentConfig(
-        node_name=node_name,
-        node_uid=config.node_uid,
-        ha_url=config.ha_url,
-        ha_url_mode=ha_url_mode,
-        heartbeat_webhook_url=config.heartbeat_webhook_url,
-        metrics_webhook_url=config.metrics_webhook_url,
-        command_result_webhook_url=config.command_result_webhook_url,
-        command_poll_webhook_url=config.command_poll_webhook_url,
-        node_id=config.node_id,
-        node_secret=config.node_secret,
-        allowed_ha_name=config.allowed_ha_name,
-        hardware_profile=hardware_profile,
-        raspberry_model_override=raspberry_override,
-        temperature_source=temperature_source,
-        temperature_path=temperature_path,
-        primary_interface=primary_interface,
-        extra_interfaces=extra_interfaces,
-    )
-    save_config(next_config)
+    for field in CONFIG_FIELDS:
+        current = edit_config_field(current, field.key, guided=True)
+    save_config(current)
     LOGGER.info("Configuration saved")
     print("Configuration saved.")
+    print(restart_agent_service_if_running())
+
+
+def configure_agent(config: AgentConfig) -> None:
+    current = normalize_agent_config(config)
+    while True:
+        print("")
+        print("HostWatch agent configuration")
+        print("-----------------------------")
+        print(f"Config file: {DEFAULT_CONFIG_PATH}")
+        for index, field in enumerate(CONFIG_FIELDS, start=1):
+            print(f"{index}. {field.label}: {config_field_display_value(current, field.key)}")
+        print("")
+        print("s. Save and exit")
+        print("q. Quit without saving")
+        choice = input("Select item to edit: ").strip().lower()
+        if choice == "s":
+            save_config(current)
+            LOGGER.info("Configuration saved")
+            print("Configuration saved.")
+            print(restart_agent_service_if_running())
+            return
+        if choice == "q":
+            print("Configuration unchanged.")
+            return
+        try:
+            index = int(choice) - 1
+        except ValueError:
+            print(f"Invalid choice: {choice}")
+            continue
+        if index < 0 or index >= len(CONFIG_FIELDS):
+            print(f"Invalid choice: {choice}")
+            continue
+        current = edit_config_field(current, CONFIG_FIELDS[index].key, guided=False)
 
 
 def prompt_text(label: str, default: str) -> str:
@@ -2548,6 +2874,253 @@ def prompt_csv(label: str, current: list[str]) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def prompt_int(label: str, current: int, *, minimum: int = 0) -> int:
+    while True:
+        answer = input(f"{label} [{current}]: ").strip()
+        if not answer:
+            return current
+        try:
+            value = int(answer)
+        except ValueError:
+            print("Please enter a valid integer.")
+            continue
+        if value < minimum:
+            print(f"Please enter a value greater than or equal to {minimum}.")
+            continue
+        return value
+
+
+CONFIG_FIELDS: tuple[ConfigField, ...] = (
+    ConfigField("node_name", "Node name"),
+    ConfigField("ha_url_mode", "Home Assistant URL mode"),
+    ConfigField("hardware_profile", "Hardware profile"),
+    ConfigField("raspberry_model_override", "Raspberry Pi model override"),
+    ConfigField("temperature_source", "Temperature source"),
+    ConfigField("temperature_path", "Temperature file path"),
+    ConfigField("primary_interface", "Primary network interface"),
+    ConfigField("extra_interfaces", "Additional network interfaces"),
+    ConfigField("connection_style", "Connection style"),
+    ConfigField("vpn_type", "VPN type"),
+    ConfigField("vpn_name", "VPN connection name/interface"),
+    ConfigField("vpn_health_host", "VPN health host"),
+    ConfigField("internet_health_host", "Internet health host"),
+    ConfigField("vpn_retries_before_reboot", "Reconnect attempts before reboot"),
+    ConfigField("vpn_max_reboots_per_day", "Maximum automatic reboots per day"),
+)
+
+
+def edit_config_field(config: AgentConfig, key: str, *, guided: bool) -> AgentConfig:
+    if key == "node_name":
+        return replace_config(config, node_name=prompt_text("Node name", config.node_name))
+    if key == "ha_url_mode":
+        return replace_config(
+            config,
+            ha_url_mode=prompt_choice(
+                "Home Assistant URL mode for pairing/webhooks",
+                config.ha_url_mode,
+                ("local", "external"),
+            ),
+        )
+    if key == "hardware_profile":
+        return replace_config(
+            config,
+            hardware_profile=prompt_choice(
+                "Hardware profile",
+                config.hardware_profile,
+                ("auto", "physical", "vm", "raspberry_pi"),
+            ),
+        )
+    if key == "raspberry_model_override":
+        value = prompt_text("Raspberry Pi model override (blank for auto/none)", config.raspberry_model_override or "").strip() or None
+        return replace_config(config, raspberry_model_override=value)
+    if key == "temperature_source":
+        source = prompt_choice("Temperature source", config.temperature_source, ("auto", "none", "path"))
+        next_path = config.temperature_path if source == "path" else None
+        return replace_config(config, temperature_source=source, temperature_path=next_path)
+    if key == "temperature_path":
+        if config.temperature_source != "path":
+            if not guided:
+                print("Set temperature source to 'path' first.")
+            return config
+        value = prompt_text("Temperature file path", config.temperature_path or "/sys/class/thermal/thermal_zone0/temp").strip() or None
+        return replace_config(config, temperature_path=value)
+    if key == "primary_interface":
+        value = prompt_text(
+            "Primary network interface for discovery/IP display (auto or interface name)",
+            config.primary_interface,
+        ).strip() or "auto"
+        return replace_config(config, primary_interface=value)
+    if key == "extra_interfaces":
+        return replace_config(
+            config,
+            extra_interfaces=prompt_csv(
+                "Additional network interfaces for IP display (comma separated, blank for none)",
+                config.extra_interfaces or [],
+            ),
+        )
+    if key == "connection_style":
+        value = prompt_choice("Connection style", config.connection_style, ("local", "vpn"))
+        updates: dict[str, Any] = {"connection_style": value}
+        if value == "local":
+            updates.update(
+                {
+                    "vpn_type": None,
+                    "vpn_name": None,
+                    "vpn_retries_before_reboot": 0,
+                    "vpn_max_reboots_per_day": 1,
+                }
+            )
+        elif config.vpn_type is None:
+            updates["vpn_type"] = "wireguard"
+        return replace_config(config, **updates)
+    if key == "vpn_type":
+        if config.connection_style != "vpn":
+            if not guided:
+                print("Set connection style to 'vpn' first.")
+            return config
+        return replace_config(
+            config,
+            vpn_type=prompt_choice("VPN type", config.vpn_type or "wireguard", ("wireguard", "openvpn")),
+        )
+    if key == "vpn_name":
+        if config.connection_style != "vpn":
+            if not guided:
+                print("Set connection style to 'vpn' first.")
+            return config
+        default_name = config.vpn_name or ("wg0" if config.vpn_type == "wireguard" else "client")
+        value = prompt_text("VPN connection name/interface", default_name).strip() or None
+        return replace_config(config, vpn_name=value)
+    if key == "vpn_health_host":
+        if config.connection_style != "vpn":
+            if not guided:
+                print("Set connection style to 'vpn' first.")
+            return config
+        value = prompt_text("VPN health host or IP address", config.vpn_health_host or "").strip() or None
+        return replace_config(config, vpn_health_host=value)
+    if key == "internet_health_host":
+        if config.connection_style != "vpn":
+            if not guided:
+                print("Set connection style to 'vpn' first.")
+            return config
+        value = prompt_text("Internet health host or IP address", config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST).strip() or DEFAULT_INTERNET_HEALTH_HOST
+        return replace_config(config, internet_health_host=value)
+    if key == "vpn_retries_before_reboot":
+        if config.connection_style != "vpn":
+            if not guided:
+                print("Set connection style to 'vpn' first.")
+            return config
+        value = prompt_int(
+            "Reconnect attempts before automatic reboot (0 disables reboot)",
+            config.vpn_retries_before_reboot,
+            minimum=0,
+        )
+        return replace_config(config, vpn_retries_before_reboot=value)
+    if key == "vpn_max_reboots_per_day":
+        if config.connection_style != "vpn":
+            if not guided:
+                print("Set connection style to 'vpn' first.")
+            return config
+        value = prompt_int(
+            "Maximum automatic reboots per day (0 disables the daily limit)",
+            config.vpn_max_reboots_per_day,
+            minimum=0,
+        )
+        return replace_config(config, vpn_max_reboots_per_day=value)
+    return config
+
+
+def replace_config(config: AgentConfig, **updates: Any) -> AgentConfig:
+    return normalize_agent_config(AgentConfig(**{**config.__dict__, **updates}))
+
+
+def config_field_display_value(config: AgentConfig, key: str) -> str:
+    if key == "node_name":
+        return config.node_name
+    if key == "ha_url_mode":
+        return config.ha_url_mode
+    if key == "hardware_profile":
+        return config.hardware_profile
+    if key == "raspberry_model_override":
+        return config.raspberry_model_override or "auto"
+    if key == "temperature_source":
+        return config.temperature_source
+    if key == "temperature_path":
+        return config.temperature_path or "none"
+    if key == "primary_interface":
+        return config.primary_interface
+    if key == "extra_interfaces":
+        return ", ".join(config.extra_interfaces or []) or "none"
+    if key == "connection_style":
+        return config.connection_style
+    if key == "vpn_type":
+        return config.vpn_type or "none"
+    if key == "vpn_name":
+        return config.vpn_name or "none"
+    if key == "vpn_health_host":
+        return config.vpn_health_host or "none"
+    if key == "internet_health_host":
+        return config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST
+    if key == "vpn_retries_before_reboot":
+        return str(config.vpn_retries_before_reboot)
+    if key == "vpn_max_reboots_per_day":
+        return str(config.vpn_max_reboots_per_day)
+    return "unknown"
+
+
+def normalize_text_value(value: Any, default: str) -> str:
+    if not isinstance(value, str):
+        return default
+    normalized = value.strip()
+    return normalized or default
+
+
+def normalize_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def normalize_choice_value(value: Any, choices: tuple[str, ...], default: str | None) -> str | None:
+    normalized = normalize_optional_text(value)
+    if normalized in choices:
+        return normalized
+    return default
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        normalized = normalize_optional_text(item)
+        if normalized:
+            result.append(normalized)
+    return result
+
+
+def restart_agent_service_if_running() -> str:
+    service_name = DEFAULT_SERVICE_NAME
+    try:
+        active = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        return f"Configuration saved. Could not check {service_name}: {exc}"
+    if active.returncode != 0:
+        return "Configuration saved. Restart the agent manually if it is not running under systemd."
+    result = run_power_command(privileged_command(["systemctl", "restart", service_name]), f"Restarting {service_name}")
+    if result["status"] == "completed":
+        return f"Configuration saved. {service_name} was restarted to apply the changes."
+    return f"Configuration saved. Restart required to apply changes: {result['message'].strip()}"
+
+
 def iso_timestamp(timestamp: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
 
@@ -2557,6 +3130,13 @@ def parse_iso_timestamp(value: str) -> float:
         return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
         return 0.0
+
+
+def parse_int_value(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def collect_configured_ip_addresses(config: AgentConfig) -> dict[str, Any]:
@@ -2650,11 +3230,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="HostWatch agent")
     parser.add_argument("mode", nargs="?", default="run", choices=["run", "pair", "config"])
     parser.add_argument("--port", type=int, default=DEFAULT_PAIRING_PORT)
+    parser.add_argument("--guided", action="store_true", help="Use the guided configuration flow for config mode")
     args = parser.parse_args()
 
     config = load_config()
     if args.mode == "config":
-        configure_agent(config)
+        if args.guided:
+            configure_agent_guided(config)
+        else:
+            configure_agent(config)
         return
     if args.mode == "pair":
         run_pair(config, args.port)

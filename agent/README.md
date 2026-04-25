@@ -41,6 +41,15 @@ The installer:
 
 After installation, the agent starts automatically after every boot.
 
+The agent configuration file is self-healing:
+
+- the runtime always normalizes `agent.json` to the current supported schema
+- missing fields are written back automatically with defaults
+- invalid or incomplete VPN recovery settings fall back safely to `local`
+- older configs keep working without manual migration steps
+
+When `python3 hostwatch_agent.py config` or `python3 hostwatch_agent.py config --guided` saves changes on a systemd-based host, the tool also tries to restart `hostwatch-agent.service` immediately so the new configuration becomes active without a manual reboot.
+
 An update with `--update` stops a running `hostwatch-agent.service`, replaces the agent, wrapper, and systemd unit, keeps `/etc/hostwatch/agent.json` and `/var/lib/hostwatch/agent.state.json` unchanged, and starts the service again afterwards. It does not trigger a new pairing flow.
 
 Removal with `--remove` stops and disables `hostwatch-agent.service` and deletes the service, wrapper, installation directory, config, and state. The node must then be installed and paired again from scratch.
@@ -81,6 +90,29 @@ sudo ./install.sh --no-enable
 
 `--no-pair` is useful when you want to reuse an existing `/etc/hostwatch/agent.json`.
 
+## Configuration Modes
+
+The agent has two configuration experiences:
+
+- `python3 hostwatch_agent.py config`
+  Opens a persistent text menu for editing existing settings.
+- `python3 hostwatch_agent.py config --guided`
+  Runs the guided question flow.
+
+The installer uses the guided flow automatically during first-time setup.
+
+VPN recovery is optional. If `connectionStyle` is left at `local`, the agent behaves exactly like a normal direct HostWatch node. When set to `vpn`, the agent can restart an allowlisted WireGuard or OpenVPN systemd tunnel after repeated Home Assistant request failures.
+
+The VPN recovery flow is conservative:
+
+- repeated failed requests to Home Assistant trigger connectivity diagnostics
+- the agent pings a configured `vpnHealthHost`
+- if that host is unreachable, the agent temporarily stops the configured VPN tunnel
+- it then pings `internetHealthHost` without the tunnel
+- the tunnel is always started again afterwards
+- only when internet works without the tunnel does the agent treat the issue as a likely VPN problem and count a reconnect attempt
+- if the internet is also down without the tunnel, the agent assumes a broader uplink/WAN problem and skips VPN recovery for a cooldown period
+
 ## Home Assistant Entity IDs
 
 New entities use the suggested entity ID pattern `hostwatch_<node_name>_<entity>`. `<node_name>` is the Home Assistant slugified node name, for example `example-node` becomes `example_node`.
@@ -105,6 +137,8 @@ sensor.hostwatch_<node_name>_fs_root_available_bytes
 sensor.hostwatch_<node_name>_uptime_seconds
 sensor.hostwatch_<node_name>_apt_upgradable_count
 sensor.hostwatch_<node_name>_apt_last_checked
+sensor.hostwatch_<node_name>_vpn_reconnects_today
+sensor.hostwatch_<node_name>_vpn_last_reconnect
 sensor.hostwatch_<node_name>_maintenance_mode
 sensor.hostwatch_<node_name>_ip_address_<interface>
 ```
@@ -145,6 +179,7 @@ These entries exist only as commands inside the maintenance page. Agent software
 Notes:
 
 - `sensor.hostwatch_<node_name>_ip_address_<interface>` is created once per reported network interface, for example `sensor.hostwatch_example_node_ip_address_eth0`.
+- `sensor.hostwatch_<node_name>_vpn_reconnects_today` and `sensor.hostwatch_<node_name>_vpn_last_reconnect` are created only for nodes configured with `connectionStyle = vpn`.
 - `binary_sensor.hostwatch_<node_name>_bootloader_update_available` is created only for Raspberry Pi nodes when bootloader data is present.
 - Existing entities are not renamed automatically by Home Assistant. The naming scheme applies to newly created entities or after manually removing and recreating old entity IDs.
 

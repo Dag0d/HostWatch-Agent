@@ -346,7 +346,7 @@ EOF
 configure_and_pair() {
   if [ "$RUN_CONFIG" -eq 1 ]; then
     log "Starting interactive agent configuration"
-    "$BIN_PATH" config
+    "$BIN_PATH" config --guided
   fi
 
   if [ "$RUN_PAIR" -eq 1 ]; then

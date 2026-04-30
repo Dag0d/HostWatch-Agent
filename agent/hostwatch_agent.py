@@ -33,7 +33,7 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "2026.4.6"
+AGENT_VERSION = "2026.4.7"
 DEFAULT_CONFIG_PATH = Path(os.environ.get("HOSTWATCH_CONFIG_PATH", "/etc/hostwatch/agent.json"))
 DEFAULT_STATE_PATH = Path(os.environ.get("HOSTWATCH_STATE_PATH", str(DEFAULT_CONFIG_PATH.with_suffix(".state.json"))))
 DEFAULT_SERVICE_NAME = os.environ.get("HOSTWATCH_SERVICE_NAME", "hostwatch-agent.service")
@@ -47,6 +47,7 @@ APT_UPDATE_FRESH_SECONDS = 30 * 60
 VPN_RECOVERY_FAILURE_THRESHOLD = int(os.environ.get("HOSTWATCH_VPN_RECOVERY_FAILURE_THRESHOLD", "3"))
 VPN_RECOVERY_COOLDOWN_SECONDS = int(os.environ.get("HOSTWATCH_VPN_RECOVERY_COOLDOWN_SECONDS", "45"))
 VPN_INTERNET_DOWN_RECHECK_SECONDS = int(os.environ.get("HOSTWATCH_VPN_INTERNET_DOWN_RECHECK_SECONDS", "300"))
+VPN_RECOVERY_HISTORY_LIMIT = int(os.environ.get("HOSTWATCH_VPN_RECOVERY_HISTORY_LIMIT", "3"))
 DEFAULT_INTERNET_HEALTH_HOST = os.environ.get("HOSTWATCH_INTERNET_HEALTH_HOST", "8.8.8.8")
 RPI_NOTES_URL_TEMPLATE = "https://raw.githubusercontent.com/raspberrypi/rpi-eeprom/refs/heads/master/firmware-{chip}/release-notes.md"
 RPI_EEPROM_TARBALL_URL = "https://github.com/raspberrypi/rpi-eeprom/archive/refs/heads/master.tar.gz"
@@ -232,6 +233,7 @@ class VpnRecoveryManager:
             return
         self._consecutive_failures = 0
         self._reconnect_attempts_since_success = 0
+        self._mark_last_pending_entry_recovered()
 
     def record_failure(self, kind: str, exc: Exception) -> None:
         if not self.enabled or SHUTDOWN_EVENT.is_set():
@@ -272,9 +274,24 @@ class VpnRecoveryManager:
         health_host = self.config.vpn_health_host
         if not health_host:
             return
+        history_entry: dict[str, Any] = {
+            "started_at": iso_timestamp(now),
+            "request_kind": kind,
+            "request_error": str(exc),
+            "vpn_type": self.config.vpn_type,
+            "vpn_name": self.config.vpn_name,
+            "vpn_health_host": health_host,
+            "internet_health_host": self.config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST,
+            "ha_host": ha_url_hostname(self.config.ha_url),
+            "ha_host_ips_before": resolve_host_ips(ha_url_hostname(self.config.ha_url)),
+        }
         if ping_host(health_host):
+            history_entry["vpn_health_ok"] = True
+            history_entry["action"] = "skip_vpn_health_reachable"
+            history_entry["ended_at"] = iso_timestamp(time.time())
             payload["connectivity_state"] = "ha_failed"
             self._state.set("vpn_recovery", payload)
+            self._append_history_entry(history_entry)
             LOGGER.warning(
                 "HA connectivity failed via %s (%s), but VPN health host %s is reachable; skipping VPN recovery",
                 kind,
@@ -283,10 +300,16 @@ class VpnRecoveryManager:
             )
             return
 
-        internet_ok_without_vpn = test_internet_without_vpn(self.config)
-        if not internet_ok_without_vpn:
+        history_entry["vpn_health_ok"] = False
+        diagnostic = test_internet_without_vpn(self.config)
+        history_entry.update(diagnostic)
+        history_entry["ha_host_ips_after"] = resolve_host_ips(ha_url_hostname(self.config.ha_url))
+        if not diagnostic.get("internet_ok_without_vpn"):
+            history_entry["action"] = "skip_internet_down"
+            history_entry["ended_at"] = iso_timestamp(time.time())
             payload["connectivity_state"] = "internet_down"
             self._state.set("vpn_recovery", payload)
+            self._append_history_entry(history_entry)
             LOGGER.warning(
                 "HA connectivity failed via %s (%s) and internet host %s is unreachable without the tunnel; skipping VPN recovery for now",
                 kind,
@@ -296,7 +319,7 @@ class VpnRecoveryManager:
             return
 
         if self.config.vpn_retries_before_reboot > 0 and self._reconnect_attempts_since_success >= self.config.vpn_retries_before_reboot:
-            self._maybe_reboot_after_failed_retries(kind, exc)
+            self._maybe_reboot_after_failed_retries(kind, exc, history_entry)
             return
 
         payload["connectivity_state"] = "vpn_suspect"
@@ -304,6 +327,9 @@ class VpnRecoveryManager:
         payload["reconnects_today"] = int(payload.get("reconnects_today", 0)) + 1
         self._state.set("vpn_recovery", payload)
         self._reconnect_attempts_since_success += 1
+        history_entry["action"] = "tunnel_down_up"
+        history_entry["ended_at"] = iso_timestamp(time.time())
+        self._append_history_entry(history_entry, pending_recovery=True)
         LOGGER.warning(
             "HA connectivity failed via %s (%s). VPN health host %s is unreachable, but internet without the tunnel works. A VPN reconnect cycle was attempted for %s '%s'",
             kind,
@@ -313,10 +339,13 @@ class VpnRecoveryManager:
             self.config.vpn_name,
         )
 
-    def _maybe_reboot_after_failed_retries(self, kind: str, exc: Exception) -> None:
+    def _maybe_reboot_after_failed_retries(self, kind: str, exc: Exception, history_entry: dict[str, Any]) -> None:
         now = time.time()
         payload = self._current_payload(now)
         if self.config.vpn_max_reboots_per_day > 0 and int(payload.get("auto_reboots_today", 0)) >= self.config.vpn_max_reboots_per_day:
+            history_entry["action"] = "skip_reboot_limit_reached"
+            history_entry["ended_at"] = iso_timestamp(time.time())
+            self._append_history_entry(history_entry)
             LOGGER.warning(
                 "HA connectivity still failed via %s (%s), but the daily auto-reboot limit has been reached",
                 kind,
@@ -328,12 +357,18 @@ class VpnRecoveryManager:
             self._reconnect_attempts_since_success,
         )
         result = run_power_command(privileged_command(["systemctl", "reboot", "--no-block"]), "Automatic reboot triggered")
+        history_entry["action"] = "reboot"
+        history_entry["reboot_result"] = result["status"]
+        history_entry["reboot_message"] = result["message"].strip()
+        history_entry["ended_at"] = iso_timestamp(time.time())
         if result["status"] == "completed":
             payload["last_auto_reboot_at"] = iso_timestamp(now)
             payload["auto_reboots_today"] = int(payload.get("auto_reboots_today", 0)) + 1
             self._state.set("vpn_recovery", payload)
+            self._append_history_entry(history_entry, pending_recovery=True)
             SHUTDOWN_EVENT.set()
         else:
+            self._append_history_entry(history_entry)
             LOGGER.warning("Automatic reboot failed: %s", result["message"].strip())
 
     def _current_payload(self, now: float) -> dict[str, Any]:
@@ -345,6 +380,37 @@ class VpnRecoveryManager:
             payload["reconnects_today"] = 0
             payload["auto_reboots_today"] = 0
         return payload
+
+    def _append_history_entry(self, entry: dict[str, Any], *, pending_recovery: bool = False) -> None:
+        history = self._state.get("vpn_recovery_history", [])
+        items = list(history) if isinstance(history, list) else []
+        entry_id = uuid.uuid4().hex
+        items.append({"id": entry_id, **entry})
+        self._state.set("vpn_recovery_history", items[-VPN_RECOVERY_HISTORY_LIMIT:])
+        if pending_recovery:
+            self._state.set("vpn_recovery_pending_id", entry_id)
+        else:
+            self._state.set("vpn_recovery_pending_id", None)
+
+    def _mark_last_pending_entry_recovered(self) -> None:
+        pending_id = self._state.get("vpn_recovery_pending_id")
+        if not isinstance(pending_id, str) or not pending_id:
+            return
+        history = self._state.get("vpn_recovery_history", [])
+        if not isinstance(history, list):
+            self._state.set("vpn_recovery_pending_id", None)
+            return
+        updated = False
+        recovered_at = iso_timestamp(time.time())
+        for item in history:
+            if not isinstance(item, dict) or item.get("id") != pending_id:
+                continue
+            item["recovered_at"] = recovered_at
+            updated = True
+            break
+        if updated:
+            self._state.set("vpn_recovery_history", history[-VPN_RECOVERY_HISTORY_LIMIT:])
+        self._state.set("vpn_recovery_pending_id", None)
 
 
 class DiscoveryHandle:
@@ -1593,6 +1659,17 @@ def poll_commands(
         )
         LOGGER.info("Command completed: fetch_command_output")
         return
+    if command_type == "show_vpn_recovery_history":
+        send_command_event(
+            config,
+            command,
+            "finished",
+            "completed",
+            format_vpn_recovery_history(collector._state.get("vpn_recovery_history", [])),
+            returncode=0,
+        )
+        LOGGER.info("Command completed: show_vpn_recovery_history")
+        return
     send_command_event(config, command, "started", "running", "Command started\n")
     if command_type == "refresh_apt_check":
         result = run_refresh_apt_check(config, command, collector)
@@ -1771,6 +1848,62 @@ def send_command_event(
         send_json(config.command_result_webhook_url, payload)
     except (error.URLError, TimeoutError, OSError, HostWatchRequestError) as exc:
         report_request_failure("command result", exc)
+
+
+def format_vpn_recovery_history(history: Any) -> str:
+    items = history if isinstance(history, list) else []
+    if not items:
+        return "No VPN recovery history recorded.\n"
+    lines = ["VPN recovery history", "--------------------", ""]
+    for index, item in enumerate(reversed(items[-VPN_RECOVERY_HISTORY_LIMIT:]), start=1):
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"Entry {index}")
+        lines.append(f"started: {item.get('started_at') or 'unknown'}")
+        lines.append(f"ended: {item.get('ended_at') or 'unknown'}")
+        lines.append(f"request kind: {item.get('request_kind') or 'unknown'}")
+        lines.append(f"request error: {item.get('request_error') or 'unknown'}")
+        lines.append(f"vpn type: {item.get('vpn_type') or 'unknown'}")
+        lines.append(f"vpn name: {item.get('vpn_name') or 'unknown'}")
+        lines.append(f"vpn health host: {item.get('vpn_health_host') or 'unknown'}")
+        lines.append(f"vpn health reachable: {format_bool(item.get('vpn_health_ok'))}")
+        lines.append(f"internet health host: {item.get('internet_health_host') or 'unknown'}")
+        lines.append(f"internet without tunnel reachable: {format_bool(item.get('internet_ok_without_vpn'))}")
+        lines.append(f"action: {item.get('action') or 'unknown'}")
+        lines.append(f"tunnel stop result: {item.get('tunnel_stop_result') or 'unknown'}")
+        if item.get("tunnel_stop_message"):
+            lines.append(f"tunnel stop message: {item.get('tunnel_stop_message')}")
+        lines.append(f"tunnel start result: {item.get('tunnel_start_result') or 'unknown'}")
+        if item.get("tunnel_start_message"):
+            lines.append(f"tunnel start message: {item.get('tunnel_start_message')}")
+        lines.append(f"HA host: {item.get('ha_host') or 'unknown'}")
+        lines.append(f"HA host IPs before: {format_list(item.get('ha_host_ips_before'))}")
+        lines.append(f"HA host IPs after: {format_list(item.get('ha_host_ips_after'))}")
+        if item.get("wireguard_endpoint_before") is not None or item.get("wireguard_endpoint_after") is not None:
+            lines.append(f"WireGuard endpoint before: {item.get('wireguard_endpoint_before') or 'unknown'}")
+            lines.append(f"WireGuard endpoint after: {item.get('wireguard_endpoint_after') or 'unknown'}")
+            lines.append(f"WireGuard endpoint changed: {format_bool(item.get('wireguard_endpoint_changed'))}")
+        if item.get("reboot_result") is not None:
+            lines.append(f"reboot result: {item.get('reboot_result')}")
+            lines.append(f"reboot message: {item.get('reboot_message') or '-'}")
+        if item.get("recovered_at") is not None:
+            lines.append(f"HA contact recovered at: {item.get('recovered_at')}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def format_bool(value: Any) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
+def format_list(value: Any) -> str:
+    if isinstance(value, list) and value:
+        return ", ".join(str(item) for item in value)
+    return "unknown"
 
 
 def run_refresh_apt_check(
@@ -2178,6 +2311,15 @@ def build_vpn_start_command(config: AgentConfig) -> list[str] | None:
     return None
 
 
+def build_wireguard_show_command(config: AgentConfig) -> list[str] | None:
+    if config.connection_style != "vpn" or config.vpn_type != "wireguard" or not config.vpn_name:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+", config.vpn_name):
+        return None
+    executable = shutil.which("wg") or "wg"
+    return privileged_command([executable, "show", config.vpn_name, "endpoints"])
+
+
 def ping_host(host: str, *, timeout_seconds: int = 3) -> bool:
     target = (host or "").strip()
     if not target:
@@ -2198,28 +2340,112 @@ def ping_host(host: str, *, timeout_seconds: int = 3) -> bool:
         return False
 
 
-def test_internet_without_vpn(config: AgentConfig) -> bool:
+def test_internet_without_vpn(config: AgentConfig) -> dict[str, Any]:
     """Temporarily stop the configured VPN, test internet reachability, and always bring it back."""
     stop_command = build_vpn_stop_command(config)
     start_command = build_vpn_start_command(config)
+    before_endpoint = read_wireguard_endpoint(config)
+    result: dict[str, Any] = {
+        "internet_ok_without_vpn": False,
+        "tunnel_stop_result": "unavailable",
+        "tunnel_start_result": "unavailable",
+        "wireguard_endpoint_before": before_endpoint,
+        "wireguard_endpoint_after": None,
+        "wireguard_endpoint_changed": None,
+    }
     if stop_command is None or start_command is None:
         LOGGER.warning("Cannot test internet without VPN because the tunnel commands are not available")
-        return False
+        return result
     stop_result = run_power_command(stop_command, f"Stopping {config.vpn_type} connection {config.vpn_name}")
+    result["tunnel_stop_result"] = stop_result["status"]
+    result["tunnel_stop_message"] = stop_result["message"].strip()
     if stop_result["status"] != "completed":
         LOGGER.warning("Failed to stop VPN tunnel for internet diagnostics: %s", stop_result["message"].strip())
-        return False
+        return result
     internet_ok = False
     try:
         time.sleep(2)
         internet_ok = ping_host(config.internet_health_host or DEFAULT_INTERNET_HEALTH_HOST)
     finally:
         start_result = run_power_command(start_command, f"Starting {config.vpn_type} connection {config.vpn_name}")
+        result["tunnel_start_result"] = start_result["status"]
+        result["tunnel_start_message"] = start_result["message"].strip()
         if start_result["status"] != "completed":
             LOGGER.warning("Failed to restore VPN tunnel after internet diagnostics: %s", start_result["message"].strip())
         else:
             LOGGER.info("Restored VPN tunnel after connectivity diagnostics")
-    return internet_ok
+    after_endpoint = read_wireguard_endpoint(config)
+    result["internet_ok_without_vpn"] = internet_ok
+    result["wireguard_endpoint_after"] = after_endpoint
+    if before_endpoint is not None or after_endpoint is not None:
+        result["wireguard_endpoint_changed"] = before_endpoint != after_endpoint
+    return result
+
+
+def run_capture_command(command: list[str], *, timeout: int = 10) -> dict[str, Any]:
+    if command and command[0] == "__hostwatch_root_required__":
+        return {"status": "error", "stdout": "", "stderr": "root or passwordless sudo required", "returncode": 127}
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "status": "completed" if result.returncode == 0 else "error",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        return {"status": "error", "stdout": "", "stderr": str(exc), "returncode": 127}
+
+
+def read_wireguard_endpoint(config: AgentConfig) -> str | None:
+    command = build_wireguard_show_command(config)
+    if command is None:
+        return None
+    result = run_capture_command(command, timeout=10)
+    if result["status"] != "completed":
+        return None
+    lines = [line.strip() for line in str(result["stdout"]).splitlines() if line.strip()]
+    if not lines:
+        return None
+    endpoints: list[str] = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2:
+            endpoints.append(parts[1])
+        else:
+            endpoints.append(line)
+    return ", ".join(endpoints)
+
+
+def ha_url_hostname(url: str | None) -> str | None:
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urlparse(url)
+    return parsed.hostname or None
+
+
+def resolve_host_ips(host: str | None) -> list[str]:
+    if not isinstance(host, str) or not host.strip():
+        return []
+    try:
+        results = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return []
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for item in results:
+        address = item[4][0]
+        if address in seen:
+            continue
+        seen.add(address)
+        addresses.append(address)
+    return addresses
 
 
 def run_power_command(command: list[str], success_message: str) -> dict[str, Any]:

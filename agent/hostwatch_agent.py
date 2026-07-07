@@ -8,6 +8,7 @@ import calendar
 import curses
 import curses.textpad
 import fcntl
+import gzip
 import hashlib
 import json
 import logging
@@ -33,7 +34,7 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "2026.7.0"
+AGENT_VERSION = "2026.7.1"
 DEFAULT_CONFIG_PATH = Path(os.environ.get("HOSTWATCH_CONFIG_PATH", "/etc/hostwatch/agent.json"))
 DEFAULT_STATE_PATH = Path(os.environ.get("HOSTWATCH_STATE_PATH", str(DEFAULT_CONFIG_PATH.with_suffix(".state.json"))))
 DEFAULT_SERVICE_NAME = os.environ.get("HOSTWATCH_SERVICE_NAME", "hostwatch-agent.service")
@@ -511,15 +512,40 @@ class SystemMetricsCollector:
 
     def _collect_updates(self, apt_supported: bool) -> dict[str, Any]:
         if not apt_supported:
-            return {"apt": {"supported": False, "upgradable_count": None, "checked_at": None}}
+            return {
+                "apt": {
+                    "supported": False,
+                    "upgradable_count": None,
+                    "checked_at": None,
+                    "last_upgraded_at": None,
+                },
+                "apt_update": {
+                    "supported": False,
+                    "checked_at": None,
+                    "last_upgraded_at": None,
+                    "upgradable_count": None,
+                    "updates_available": False,
+                    "preview": None,
+                },
+            }
         cached = self._state.get("apt", {})
         cached_checked_at = cached.get("checked_at")
+        last_upgraded_at = cached.get("last_upgraded_at")
+        if not isinstance(last_upgraded_at, str):
+            last_upgraded_at = read_last_apt_upgrade_at()
         checked_epoch = parse_iso_timestamp(cached_checked_at) if isinstance(cached_checked_at, str) else 0.0
         if cached and checked_epoch:
             self._apt_cache_checked_at = checked_epoch
             self._apt_cache_count = cached.get("upgradable_count")
         if cached and not is_apt_check_due(cached_checked_at):
-            return {"apt": cached}
+            if cached.get("last_upgraded_at") != last_upgraded_at:
+                cached = dict(cached)
+                cached["last_upgraded_at"] = last_upgraded_at
+                self._state.set("apt", cached)
+            return {
+                "apt": cached,
+                "apt_update": self._collect_apt_update_snapshot(last_upgraded_at),
+            }
         now = time.time()
         if self._apt_cache_checked_at and not is_apt_check_due(iso_timestamp(self._apt_cache_checked_at)):
             return {
@@ -527,7 +553,10 @@ class SystemMetricsCollector:
                     "supported": True,
                     "upgradable_count": self._apt_cache_count,
                     "checked_at": iso_timestamp(self._apt_cache_checked_at),
+                    "last_upgraded_at": last_upgraded_at,
                 }
+                ,
+                "apt_update": self._collect_apt_update_snapshot(last_upgraded_at),
             }
         try:
             result = subprocess.run(
@@ -550,10 +579,40 @@ class SystemMetricsCollector:
             "supported": True,
             "upgradable_count": self._apt_cache_count,
             "checked_at": iso_timestamp(self._apt_cache_checked_at),
+            "last_upgraded_at": last_upgraded_at,
         }
         self._state.set("apt", payload)
         LOGGER.info("APT check completed: %s upgradable package(s)", self._apt_cache_count)
-        return {"apt": payload}
+        return {
+            "apt": payload,
+            "apt_update": self._collect_apt_update_snapshot(last_upgraded_at),
+        }
+
+    def _collect_apt_update_snapshot(self, last_upgraded_at: str | None) -> dict[str, Any]:
+        """Return the explicit APT update snapshot used by the HA update entity."""
+        cached = self._state.get("apt_update", {})
+        payload = dict(cached) if isinstance(cached, dict) else {}
+        payload["supported"] = True
+        payload["last_upgraded_at"] = last_upgraded_at
+        checked_at = payload.get("checked_at")
+        if not isinstance(checked_at, str) or not checked_at:
+            payload["checked_at"] = last_upgraded_at
+            payload["updates_available"] = False
+            payload["upgradable_count"] = 0
+            payload["preview"] = None
+            self._state.set("apt_update", payload)
+            return payload
+        if (
+            payload.get("updates_available") is True
+            and isinstance(last_upgraded_at, str)
+            and parse_iso_timestamp(last_upgraded_at) >= parse_iso_timestamp(checked_at)
+        ):
+            payload["checked_at"] = last_upgraded_at
+            payload["updates_available"] = False
+            payload["upgradable_count"] = 0
+            payload["preview"] = "No packages are currently pending upgrade.\n"
+            self._state.set("apt_update", payload)
+        return payload
 
     def _collect_uptime(self) -> float:
         with Path("/proc/uptime").open("r", encoding="utf8") as handle:
@@ -1702,6 +1761,19 @@ def poll_commands(
         )
         LOGGER.info("Command completed: refresh_apt_check")
         return
+    if command_type == "prepare_apt_update":
+        result = run_prepare_apt_update(config, command, collector)
+        send_metrics(config, collector.collect())
+        send_command_event(
+            config,
+            command,
+            "finished",
+            result["status"],
+            result["message"],
+            returncode=result.get("returncode"),
+        )
+        LOGGER.info("Command completed: prepare_apt_update status=%s", result["status"])
+        return
     if command_type == "refresh_bootloader_check":
         collector._state.set("bootloader", {})
         snapshot = collector.collect()
@@ -1952,6 +2024,65 @@ def run_refresh_apt_check(
     return {"status": "completed", "message": "APT check refreshed\n", "returncode": 0}
 
 
+def run_prepare_apt_update(
+    config: AgentConfig,
+    command: dict[str, Any],
+    collector: SystemMetricsCollector,
+) -> dict[str, Any]:
+    """Build an explicit APT update snapshot for the HA update entity."""
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    send_command_event(config, command, "chunk", "running", "Refreshing APT package indexes\n")
+    update = run_streamed_command(config, command, privileged_command(["apt-get", "update"]), timeout=600, env=env)
+    if update["returncode"] != 0:
+        return {"status": "error", "message": "APT update snapshot failed during apt-get update\n", "returncode": update["returncode"]}
+
+    send_command_event(config, command, "chunk", "running", "Collecting APT upgrade preview\n")
+    preview = run_capture_command(
+        privileged_command(["apt", "upgrade", "--simulate"]),
+        timeout=600,
+        env=env,
+    )
+    preview_text = sanitize_apt_preview_output(merge_command_output(preview.get("stdout"), preview.get("stderr")))
+    if preview["status"] != "completed":
+        if preview_text:
+            send_command_event(config, command, "chunk", "running", preview_text)
+        return {
+            "status": "error",
+            "message": "APT update snapshot failed during apt upgrade simulation\n",
+            "returncode": preview.get("returncode"),
+        }
+
+    upgradable_count = parse_apt_preview_upgradable_count(preview_text)
+    if upgradable_count is None:
+        upgradable_count = count_upgradable_packages()
+    now = time.time()
+    checked_at = iso_timestamp(now)
+    last_upgraded_at = read_last_apt_upgrade_at()
+    apt_payload = {
+        "supported": True,
+        "upgradable_count": upgradable_count,
+        "checked_at": checked_at,
+        "last_upgraded_at": last_upgraded_at,
+    }
+    collector._apt_cache_checked_at = now
+    collector._apt_cache_count = upgradable_count
+    collector._state.set("apt", apt_payload)
+    collector._state.set(
+        "apt_update",
+        {
+            "supported": True,
+            "checked_at": checked_at,
+            "last_upgraded_at": last_upgraded_at,
+            "upgradable_count": upgradable_count,
+            "updates_available": bool(isinstance(upgradable_count, int) and upgradable_count > 0),
+            "preview": ensure_trailing_newline(preview_text),
+        },
+    )
+    send_command_event(config, command, "chunk", "running", ensure_trailing_newline(preview_text))
+    return {"status": "completed", "message": "APT update snapshot prepared\n", "returncode": 0}
+
+
 def format_apt_upgradeable_output(upgradable_count: int | None) -> str:
     lines = [
         "",
@@ -1983,6 +2114,35 @@ def format_apt_upgradeable_output(upgradable_count: int | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def parse_apt_preview_upgradable_count(preview_text: str) -> int | None:
+    match = re.search(
+        r"(?m)^(\d+)\s+upgraded,\s+\d+\s+newly installed,\s+\d+\s+to remove and\s+\d+\s+not upgraded\.",
+        preview_text,
+    )
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def count_upgradable_packages() -> int | None:
+    try:
+        result = subprocess.run(
+            ["apt", "list", "--upgradable"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    lines = [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip() and not line.startswith("Listing...")
+    ]
+    return len(lines)
+
+
 def run_apt_upgrade(config: AgentConfig, command: dict[str, Any]) -> dict[str, Any]:
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
@@ -2011,14 +2171,27 @@ def run_apt_upgrade(config: AgentConfig, command: dict[str, Any]) -> dict[str, A
 
 def mark_apt_no_updates(collector: SystemMetricsCollector) -> None:
     now = time.time()
+    upgraded_at = iso_timestamp(now)
     payload = {
         "supported": True,
         "upgradable_count": 0,
-        "checked_at": iso_timestamp(now),
+        "checked_at": upgraded_at,
+        "last_upgraded_at": upgraded_at,
     }
     collector._apt_cache_checked_at = now
     collector._apt_cache_count = 0
     collector._state.set("apt", payload)
+    collector._state.set(
+        "apt_update",
+        {
+            "supported": True,
+            "checked_at": upgraded_at,
+            "last_upgraded_at": upgraded_at,
+            "upgradable_count": 0,
+            "updates_available": False,
+            "preview": "No packages are currently pending upgrade.\n",
+        },
+    )
     LOGGER.info("APT update state cleared after successful upgrade")
 
 
@@ -2400,7 +2573,7 @@ def test_internet_without_vpn(config: AgentConfig) -> dict[str, Any]:
     return result
 
 
-def run_capture_command(command: list[str], *, timeout: int = 10) -> dict[str, Any]:
+def run_capture_command(command: list[str], *, timeout: int = 10, env: dict[str, str] | None = None) -> dict[str, Any]:
     if command and command[0] == "__hostwatch_root_required__":
         return {"status": "error", "stdout": "", "stderr": "root or passwordless sudo required", "returncode": 127}
     try:
@@ -2410,6 +2583,7 @@ def run_capture_command(command: list[str], *, timeout: int = 10) -> dict[str, A
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return {
             "status": "completed" if result.returncode == 0 else "error",
@@ -2419,6 +2593,30 @@ def run_capture_command(command: list[str], *, timeout: int = 10) -> dict[str, A
         }
     except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
         return {"status": "error", "stdout": "", "stderr": str(exc), "returncode": 127}
+
+
+def merge_command_output(stdout: Any, stderr: Any) -> str:
+    parts: list[str] = []
+    if isinstance(stdout, str) and stdout.strip():
+        parts.append(stdout.rstrip())
+    if isinstance(stderr, str) and stderr.strip():
+        parts.append(stderr.rstrip())
+    return "\n".join(parts)
+
+
+def ensure_trailing_newline(text: str) -> str:
+    if not text:
+        return ""
+    return text if text.endswith("\n") else f"{text}\n"
+
+
+def sanitize_apt_preview_output(text: str) -> str:
+    lines = [
+        line
+        for line in text.splitlines()
+        if "apt does not have a stable CLI interface" not in line
+    ]
+    return "\n".join(lines).strip()
 
 
 def read_wireguard_endpoint(config: AgentConfig) -> str | None:
@@ -2439,6 +2637,49 @@ def read_wireguard_endpoint(config: AgentConfig) -> str | None:
         else:
             endpoints.append(line)
     return ", ".join(endpoints)
+
+
+def read_last_apt_upgrade_at() -> str | None:
+    """Return the end timestamp of the latest real APT upgrade transaction."""
+    history_dir = Path("/var/log/apt")
+    if not history_dir.exists():
+        return None
+    history_paths = [history_dir / "history.log"]
+    history_paths.extend(sorted(history_dir.glob("history.log.*"), reverse=True))
+    for path in history_paths:
+        text = read_apt_history_text(path)
+        if not text:
+            continue
+        blocks = [block.strip() for block in text.split("\n\n") if block.strip()]
+        for block in reversed(blocks):
+            if "Upgrade:" not in block:
+                continue
+            for line in block.splitlines():
+                if not line.startswith("End-Date:"):
+                    continue
+                parsed = parse_apt_history_timestamp(line.partition(":")[2].strip())
+                if parsed:
+                    return parsed
+    return None
+
+
+def read_apt_history_text(path: Path) -> str | None:
+    try:
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf8", errors="replace") as handle:
+                return handle.read()
+        return path.read_text(encoding="utf8", errors="replace")
+    except OSError:
+        return None
+
+
+def parse_apt_history_timestamp(value: str) -> str | None:
+    normalized = " ".join(value.split())
+    try:
+        struct_time = time.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return iso_timestamp(time.mktime(struct_time))
 
 
 def ha_url_hostname(url: str | None) -> str | None:

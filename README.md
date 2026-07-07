@@ -21,6 +21,7 @@ The agent runs on Linux hosts and:
 - collects local system state
 - sends heartbeats and metrics to Home Assistant
 - polls Home Assistant for allowlisted maintenance actions
+- prepares explicit APT upgrade snapshots for the Home Assistant APT packages update entity
 - installs signed agent updates from this repository's GitHub Releases
 
 It is intentionally not a remote shell and does not accept arbitrary commands.

@@ -34,7 +34,7 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "2026.7.1"
+AGENT_VERSION = "2026.7.2"
 DEFAULT_CONFIG_PATH = Path(os.environ.get("HOSTWATCH_CONFIG_PATH", "/etc/hostwatch/agent.json"))
 DEFAULT_STATE_PATH = Path(os.environ.get("HOSTWATCH_STATE_PATH", str(DEFAULT_CONFIG_PATH.with_suffix(".state.json"))))
 DEFAULT_SERVICE_NAME = os.environ.get("HOSTWATCH_SERVICE_NAME", "hostwatch-agent.service")
@@ -2039,19 +2039,21 @@ def run_prepare_apt_update(
 
     send_command_event(config, command, "chunk", "running", "Collecting APT upgrade preview\n")
     preview = run_capture_command(
-        privileged_command(["apt", "upgrade", "--simulate"]),
+        privileged_command(["apt-get", "upgrade", "--assume-no"]),
         timeout=600,
         env=env,
     )
     preview_text = sanitize_apt_preview_output(merge_command_output(preview.get("stdout"), preview.get("stderr")))
     if preview["status"] != "completed":
-        if preview_text:
-            send_command_event(config, command, "chunk", "running", preview_text)
-        return {
-            "status": "error",
-            "message": "APT update snapshot failed during apt upgrade simulation\n",
-            "returncode": preview.get("returncode"),
-        }
+        returncode = preview.get("returncode")
+        if returncode not in {0, 1}:
+            if preview_text:
+                send_command_event(config, command, "chunk", "running", ensure_trailing_newline(preview_text))
+            return {
+                "status": "error",
+                "message": "APT update snapshot failed during apt upgrade preview\n",
+                "returncode": returncode,
+            }
 
     upgradable_count = parse_apt_preview_upgradable_count(preview_text)
     if upgradable_count is None:
@@ -2611,12 +2613,22 @@ def ensure_trailing_newline(text: str) -> str:
 
 
 def sanitize_apt_preview_output(text: str) -> str:
-    lines = [
-        line
-        for line in text.splitlines()
-        if "apt does not have a stable CLI interface" not in line
-    ]
-    return "\n".join(lines).strip()
+    cleaned_lines: list[str] = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.rstrip()
+        if not line.strip():
+            cleaned_lines.append("")
+            continue
+        if "apt does not have a stable CLI interface" in line:
+            continue
+        if line.strip() in {"Do you want to continue? [Y/n] N", "Abort."}:
+            continue
+        cleaned_lines.append(line)
+    while cleaned_lines and not cleaned_lines[0].strip():
+        cleaned_lines.pop(0)
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+    return "\n".join(cleaned_lines)
 
 
 def read_wireguard_endpoint(config: AgentConfig) -> str | None:

@@ -33,7 +33,7 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "2026.5.0"
+AGENT_VERSION = "2026.7.0"
 DEFAULT_CONFIG_PATH = Path(os.environ.get("HOSTWATCH_CONFIG_PATH", "/etc/hostwatch/agent.json"))
 DEFAULT_STATE_PATH = Path(os.environ.get("HOSTWATCH_STATE_PATH", str(DEFAULT_CONFIG_PATH.with_suffix(".state.json"))))
 DEFAULT_SERVICE_NAME = os.environ.get("HOSTWATCH_SERVICE_NAME", "hostwatch-agent.service")
@@ -1250,6 +1250,8 @@ def send_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
         if snippet:
             details.append(f"body={snippet}")
         raise HostWatchRequestError(", ".join(details)) from exc
+    except error.URLError as exc:
+        raise HostWatchRequestError(format_url_error(url, exc)) from exc
 
 
 def ensure_allowed_release_url(url: str) -> None:
@@ -1259,6 +1261,22 @@ def ensure_allowed_release_url(url: str) -> None:
         raise ValueError(f"release URL must use https: {url}")
     if parsed.hostname not in RELEASE_ALLOWED_HOSTS:
         raise ValueError(f"release URL host is not allowed: {parsed.hostname}")
+
+
+def format_url_error(url: str, exc: error.URLError) -> str:
+    """Return a clearer request error string for DNS and transport failures."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname or "unknown"
+    reason = exc.reason
+    if isinstance(reason, socket.gaierror):
+        message = reason.strerror or str(reason)
+        return f"DNS resolution failed for host={hostname}, url={url}: {message}"
+    if isinstance(reason, TimeoutError):
+        return f"connection timed out for host={hostname}, url={url}"
+    if isinstance(reason, OSError):
+        detail = reason.strerror or str(reason)
+        return f"connection failed for host={hostname}, url={url}: {detail}"
+    return f"request failed for host={hostname}, url={url}: {exc}"
 
 
 def fetch_url_bytes(url: str, *, timeout: int = 30, accept: str | None = None) -> bytes:
